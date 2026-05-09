@@ -7,6 +7,8 @@ class WalkRoute {
   final List<LatLng> points;
   final double distanceKm;
   final int durationMinutes;
+  final bool isSuggested;
+  final bool isSuggestedCompleted;
 
   WalkRoute({
     required this.id,
@@ -15,6 +17,8 @@ class WalkRoute {
     required this.points,
     required this.distanceKm,
     required this.durationMinutes,
+    this.isSuggested = false,
+    this.isSuggestedCompleted = false,
   });
 
   Map<String, dynamic> toJson() => {
@@ -24,6 +28,8 @@ class WalkRoute {
     'points': points.map((p) => {'lat': p.latitude, 'lng': p.longitude}).toList(),
     'distanceKm': distanceKm,
     'durationMinutes': durationMinutes,
+    'isSuggested': isSuggested,
+    'isSuggestedCompleted': isSuggestedCompleted,
   };
 
   factory WalkRoute.fromJson(Map<String, dynamic> json) => WalkRoute(
@@ -36,7 +42,14 @@ class WalkRoute {
         .toList(),
     distanceKm: json['distanceKm'] as double,
     durationMinutes: json['durationMinutes'] as int,
+    isSuggested: json['isSuggested'] as bool? ?? false,
+    isSuggestedCompleted: json['isSuggestedCompleted'] as bool? ?? false,
   );
 
-  double get speedKmh => distanceKm / (durationMinutes / 60);
+  double get speedKmh {
+    if (durationMinutes <= 0) {
+      return 0;
+    }
+    return distanceKm / (durationMinutes / 60);
+  }
 }
