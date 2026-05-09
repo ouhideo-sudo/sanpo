@@ -5,6 +5,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'models/walk_route.dart';
 import 'services/route_service.dart';
 import 'services/route_suggestion_service.dart';
+import 'config/api_keys.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -307,10 +308,22 @@ class _SanpoHomeState extends State<SanpoHome> {
     try {
       final position = await Geolocator.getCurrentPosition();
       final current = LatLng(position.latitude, position.longitude);
-      final suggestion = RouteSuggestionService.buildLoop(
-        center: current,
-        distanceKm: _selectedSuggestionDistanceKm,
-      );
+
+      RouteSuggestion suggestion;
+      if (ApiKeys.isConfigured) {
+        // Google Maps Directions API を使用
+        final service = RouteSuggestionService(mapsApiKey: ApiKeys.mapsApiKey);
+        suggestion = await service.suggestLoopRoute(
+          center: current,
+          distanceKm: _selectedSuggestionDistanceKm,
+        );
+      } else {
+        // API キー未設定時は従来の正方形ルート
+        suggestion = RouteSuggestionService.buildLoop(
+          center: current,
+          distanceKm: _selectedSuggestionDistanceKm,
+        );
+      }
 
       final polyline = Polyline(
         polylineId: const PolylineId('suggested-route'),
