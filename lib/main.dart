@@ -42,12 +42,18 @@ class SanpoHome extends StatefulWidget {
 }
 
 class _SanpoHomeState extends State<SanpoHome> {
+  static const double _destinationArrivalThresholdMeters = 35;
+
   late GoogleMapController mapController;
   late RouteService routeService;
   int _currentIndex = 0;
-  Set<Polyline> _polylines = {};
+  List<WalkRoute> _savedRoutes = [];
+  bool _showSuggestedWalkRoutes = true;
+  bool _showRegularWalkRoutes = true;
   Polyline? _suggestedPolyline;
   RouteSuggestion? _latestSuggestion;
+  LatLng? _suggestedDestination;
+  Marker? _destinationMarker;
   double _selectedSuggestionDistanceKm = 2.0;
   bool _isSuggesting = false;
   double? _targetDistanceKm;
@@ -65,22 +71,9 @@ class _SanpoHomeState extends State<SanpoHome> {
 
   Future<void> _loadSavedRoutes() async {
     final routes = await routeService.getRoutes();
-    final colors = [Colors.blue, Colors.green, Colors.orange, Colors.purple, Colors.red];
-    
-    final polylines = <Polyline>{};
-    for (int i = 0; i < routes.length; i++) {
-      polylines.add(
-        Polyline(
-          polylineId: PolylineId(routes[i].id),
-          points: routes[i].points,
-          color: colors[i % colors.length],
-          width: 3,
-        ),
-      );
-    }
-    
+
     setState(() {
-      _polylines = polylines;
+      _savedRoutes = routes;
     });
   }
 
@@ -125,8 +118,16 @@ class _SanpoHomeState extends State<SanpoHome> {
     _trackPosition();
   }
 
+  void _startRegularWalk() {
+    setState(() {
+      _suggestedDestination = null;
+      _destinationMarker = null;
+    });
+    _startRouteRecording();
+  }
+
   void _startSuggestedWalk() {
-    if (_latestSuggestion == null || _isRecording) {
+    if (_latestSuggestion == null || _suggestedDestination == null || _isRecording) {
       return;
     }
 
@@ -135,7 +136,7 @@ class _SanpoHomeState extends State<SanpoHome> {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(
-            '提案ルートで開始: ${_latestSuggestion!.distanceKm.toStringAsFixed(1)}km',
+            '提案ルートで開始: ${_latestSuggestion!.distanceKm.toStringAsFixed(1)}km（目的地まで自動記録）',
           ),
           duration: const Duration(seconds: 2),
         ),
@@ -143,7 +144,7 @@ class _SanpoHomeState extends State<SanpoHome> {
     }
   }
 
-  Future<void> _stopRouteRecording() async {
+  Future<void> _stopRouteRecording({bool isSuggestedCompleted = false}) async {
     final wasSuggestedRoute = _targetDistanceKm != null;
 
     setState(() {
@@ -164,20 +165,14 @@ class _SanpoHomeState extends State<SanpoHome> {
         distanceKm: distanceKm,
         durationMinutes: durationMinutes,
         isSuggested: wasSuggestedRoute,
-        isSuggestedCompleted: false,
+        isSuggestedCompleted: wasSuggestedRoute && isSuggestedCompleted,
       );
 
       await routeService.saveRoute(route);
 
+      await _loadSavedRoutes();
+
       setState(() {
-        _polylines.add(
-          Polyline(
-            polylineId: PolylineId(route.id),
-            points: _currentRoute,
-            color: Colors.blue,
-            width: 3,
-          ),
-        );
         _currentRoute.clear();
       });
 
@@ -194,6 +189,44 @@ class _SanpoHomeState extends State<SanpoHome> {
     }
   }
 
+  Set<Polyline> _buildSavedRoutePolylines() {
+    final polylines = <Polyline>{};
+    for (final route in _savedRoutes) {
+      if (route.isSuggested && !_showSuggestedWalkRoutes) {
+        continue;
+      }
+      if (!route.isSuggested && !_showRegularWalkRoutes) {
+        continue;
+      }
+
+      final color = route.isSuggested
+          ? (route.isSuggestedCompleted ? Colors.teal : Colors.deepOrange)
+          : Colors.blue;
+
+      polylines.add(
+        Polyline(
+          polylineId: PolylineId(route.id),
+          points: route.points,
+          color: color,
+          width: 3,
+        ),
+      );
+    }
+    return polylines;
+  }
+
+  void _toggleSuggestedFilter(bool value) {
+    setState(() {
+      _showSuggestedWalkRoutes = value;
+    });
+  }
+
+  void _toggleRegularFilter(bool value) {
+    setState(() {
+      _showRegularWalkRoutes = value;
+    });
+  }
+
   Future<void> _trackPosition() async {
     if (!_isRecording) return;
 
@@ -203,6 +236,21 @@ class _SanpoHomeState extends State<SanpoHome> {
       setState(() {
         _currentRoute.add(latLng);
       });
+
+      final reachedDestination = _targetDistanceKm != null &&
+          _suggestedDestination != null &&
+          _isNearDestination(latLng);
+
+      if (reachedDestination) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('目的地に到着しました。記録を自動保存します。'),
+            duration: Duration(seconds: 2),
+          ),
+        );
+        await _stopRouteRecording(isSuggestedCompleted: true);
+        return;
+      }
     }
 
     // 次の更新を1秒後に予約
@@ -210,13 +258,24 @@ class _SanpoHomeState extends State<SanpoHome> {
     _trackPosition();
   }
 
-  void _clearRoutes() {
+  Future<void> _clearRoutes() async {
+    await routeService.deleteAllRoutes();
+    if (!mounted) {
+      return;
+    }
+
     setState(() {
-      _polylines.clear();
+      _savedRoutes = [];
       _suggestedPolyline = null;
       _latestSuggestion = null;
+      _suggestedDestination = null;
+      _destinationMarker = null;
       _currentRoute.clear();
     });
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('保存済みルートを削除しました')),
+    );
   }
 
   Future<void> _suggestRoute() async {
@@ -237,6 +296,10 @@ class _SanpoHomeState extends State<SanpoHome> {
         center: current,
         distanceKm: _selectedSuggestionDistanceKm,
       );
+      final destination = _selectDestinationPoint(
+        points: suggestion.points,
+        origin: current,
+      );
 
       final polyline = Polyline(
         polylineId: const PolylineId('suggested-route'),
@@ -253,6 +316,12 @@ class _SanpoHomeState extends State<SanpoHome> {
         setState(() {
           _latestSuggestion = suggestion;
           _suggestedPolyline = polyline;
+          _suggestedDestination = destination;
+          _destinationMarker = Marker(
+            markerId: const MarkerId('suggested-destination'),
+            position: destination,
+            infoWindow: const InfoWindow(title: '目的地'),
+          );
         });
 
         final bounds = _computeBounds(suggestion.points);
@@ -293,6 +362,45 @@ class _SanpoHomeState extends State<SanpoHome> {
       southwest: LatLng(minLat, minLng),
       northeast: LatLng(maxLat, maxLng),
     );
+  }
+
+  LatLng _selectDestinationPoint({
+    required List<LatLng> points,
+    required LatLng origin,
+  }) {
+    if (points.isEmpty) {
+      return origin;
+    }
+
+    LatLng selected = points.first;
+    double farthestMeters = -1;
+    for (final point in points) {
+      final meters = Geolocator.distanceBetween(
+        origin.latitude,
+        origin.longitude,
+        point.latitude,
+        point.longitude,
+      );
+      if (meters > farthestMeters) {
+        farthestMeters = meters;
+        selected = point;
+      }
+    }
+    return selected;
+  }
+
+  bool _isNearDestination(LatLng currentPoint) {
+    if (_suggestedDestination == null) {
+      return false;
+    }
+
+    final meters = Geolocator.distanceBetween(
+      _suggestedDestination!.latitude,
+      _suggestedDestination!.longitude,
+      currentPoint.latitude,
+      currentPoint.longitude,
+    );
+    return meters <= _destinationArrivalThresholdMeters;
   }
 
   @override
@@ -353,7 +461,11 @@ class _SanpoHomeState extends State<SanpoHome> {
         ? '${liveDistanceKm.toStringAsFixed(2)} / ${_targetDistanceKm!.toStringAsFixed(1)} km'
         : '${liveDistanceKm.toStringAsFixed(2)} km';
 
-    final displayedPolylines = <Polyline>{..._polylines};
+    final displayedPolylines = _buildSavedRoutePolylines();
+    final displayedMarkers = <Marker>{};
+    if (_destinationMarker != null) {
+      displayedMarkers.add(_destinationMarker!);
+    }
     if (_suggestedPolyline != null) {
       displayedPolylines.add(_suggestedPolyline!);
     }
@@ -370,6 +482,7 @@ class _SanpoHomeState extends State<SanpoHome> {
             zoom: 15,
           ),
           polylines: displayedPolylines,
+          markers: displayedMarkers,
           myLocationEnabled: true,
           myLocationButtonEnabled: true,
           zoomControlsEnabled: true,
@@ -403,6 +516,23 @@ class _SanpoHomeState extends State<SanpoHome> {
                             });
                           },
                         ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: [
+                      FilterChip(
+                        label: const Text('提案散歩を表示'),
+                        selected: _showSuggestedWalkRoutes,
+                        onSelected: _toggleSuggestedFilter,
+                      ),
+                      FilterChip(
+                        label: const Text('通常散歩を表示'),
+                        selected: _showRegularWalkRoutes,
+                        onSelected: _toggleRegularFilter,
+                      ),
                     ],
                   ),
                   const SizedBox(height: 8),
@@ -441,6 +571,11 @@ class _SanpoHomeState extends State<SanpoHome> {
                             '提案: ${_latestSuggestion!.distanceKm.toStringAsFixed(1)}km '
                             '(目安 ${_latestSuggestion!.estimatedMinutes}分)',
                           ),
+                          if (_suggestedDestination != null)
+                            const Padding(
+                              padding: EdgeInsets.only(top: 4),
+                              child: Text('目的地は自動設定されます。到達時に自動保存します。'),
+                            ),
                           const SizedBox(height: 8),
                           OutlinedButton.icon(
                             onPressed: _isRecording ? null : _startSuggestedWalk,
@@ -473,14 +608,14 @@ class _SanpoHomeState extends State<SanpoHome> {
               FloatingActionButton.extended(
                 onPressed: _isRecording
                     ? _stopRouteRecording
-                    : () => _startRouteRecording(),
+                    : _startRegularWalk,
                 label: Text(_isRecording ? '停止' : '開始'),
                 icon: Icon(_isRecording ? Icons.stop : Icons.play_arrow),
                 backgroundColor: _isRecording ? Colors.red : Colors.green,
               ),
-              if (_polylines.isNotEmpty)
+              if (_savedRoutes.isNotEmpty || _suggestedPolyline != null)
                 FloatingActionButton(
-                  onPressed: _clearRoutes,
+                  onPressed: () => _clearRoutes(),
                   backgroundColor: Colors.grey,
                   child: const Icon(Icons.delete_outline),
                 ),
@@ -638,12 +773,6 @@ class _SettingsPageState extends State<SettingsPage> {
             title: const Text('位置情報精度'),
             subtitle: const Text('高精度（消費電力多）'),
             leading: const Icon(Icons.location_on),
-          ),
-          const Divider(),
-          ListTile(
-            title: const Text('ルート履歴の自動削除'),
-            subtitle: const Text('30日以上前のルートを自動削除'),
-            leading: const Icon(Icons.auto_delete),
           ),
           const Divider(),
           ListTile(

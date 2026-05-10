@@ -41,6 +41,10 @@ class RouteService {
     );
   }
 
+  Future<void> deleteAllRoutes() async {
+    await prefs.remove(_routesKey);
+  }
+
   /// 2つの地点間の距離をキロメートルで計算（Haversine公式）
   static double calculateDistance(LatLng point1, LatLng point2) {
     const R = 6371; // 地球の半径（キロメートル）
