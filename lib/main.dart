@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart';
 import 'package:geolocator/geolocator.dart';
+import 'package:package_info_plus/package_info_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'models/walk_route.dart';
 import 'services/route_service.dart';
@@ -737,10 +738,43 @@ class _RoutesHistoryPageState extends State<RoutesHistoryPage> {
   }
 }
 
-class SettingsPage extends StatelessWidget {
+class SettingsPage extends StatefulWidget {
   const SettingsPage({super.key, required this.prefs});
 
   final SharedPreferences prefs;
+
+  @override
+  State<SettingsPage> createState() => _SettingsPageState();
+}
+
+class _SettingsPageState extends State<SettingsPage> {
+  String _appVersionLabel = '取得中...';
+
+  @override
+  void initState() {
+    super.initState();
+    _loadAppVersion();
+  }
+
+  Future<void> _loadAppVersion() async {
+    try {
+      final info = await PackageInfo.fromPlatform();
+      final label = '${info.version}+${info.buildNumber}';
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _appVersionLabel = label;
+      });
+    } catch (_) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _appVersionLabel = '取得失敗';
+      });
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -768,7 +802,7 @@ class SettingsPage extends StatelessWidget {
           const Divider(),
           ListTile(
             title: const Text('バージョン'),
-            subtitle: const Text('1.0.0'),
+            subtitle: Text(_appVersionLabel),
             leading: const Icon(Icons.info),
           ),
         ],
