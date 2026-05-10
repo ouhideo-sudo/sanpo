@@ -1,11 +1,34 @@
 import 'dart:math';
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart';
 import 'package:http/http.dart' as http;
 import '../models/directions_route.dart';
+
+enum RouteSuggestionFailureType {
+  noRouteFound,
+  apiKeyDenied,
+  quotaExceeded,
+  invalidRequest,
+  timeout,
+  network,
+  unknown,
+}
+
+class RouteSuggestionException implements Exception {
+  RouteSuggestionException({
+    required this.type,
+    required this.userMessage,
+    this.rawStatus,
+  });
+
+  final RouteSuggestionFailureType type;
+  final String userMessage;
+  final String? rawStatus;
+}
 
 class RouteSuggestion {
   RouteSuggestion({
@@ -24,8 +47,6 @@ class RouteSuggestion {
 }
 
 class RouteSuggestionService {
-  // 徒歩速度 4.8 km/h を仮定
-  static const double _walkingSpeedKmh = 4.8;
   static const double _earthRadiusKm = 6371.0;
 
   /// Google Maps Directions API キー
@@ -41,66 +62,98 @@ class RouteSuggestionService {
     required double distanceKm,
   }) async {
     try {
-      // 往路と復路で距離を分割
-      final halfDistanceKm = distanceKm / 2;
+      // 方位と半径を段階的に変えて候補を試し、提案成功率を上げる
+      const bearingSteps = <double>[0, 60, 120, 180, 240, 300];
+      const distanceScales = <double>[0.5, 0.42, 0.35];
+      final random = Random();
+      final baseBearing = random.nextDouble() * 360;
+      DirectionsRoute? fallbackOutbound;
 
-      // 現在地から半径と方向をランダムに選んで、往路の目的地を決定
-      final bearing = Random().nextDouble() * 360;
-      final destination = _move(center, halfDistanceKm, bearing);
+      for (final scale in distanceScales) {
+        for (final step in bearingSteps) {
+          final bearing = (baseBearing + step) % 360;
+          final destination = _move(center, distanceKm * scale, bearing);
 
-      // Directions API で往路を取得
-      final outboundRoute = await _fetchDirectionsRoute(
-        origin: center,
-        destination: destination,
-      );
+          final outboundRoute = await _tryFetchRoute(
+            origin: center,
+            destination: destination,
+          );
+          if (outboundRoute == null) {
+            continue;
+          }
+          fallbackOutbound ??= outboundRoute;
 
-      if (outboundRoute == null) {
-        // API 失敗時は従来の正方形ルートにフォールバック
-        return buildLoop(center: center, distanceKm: distanceKm);
+          final returnRoute = await _tryFetchRoute(
+            origin: destination,
+            destination: center,
+          );
+          if (returnRoute == null) {
+            continue;
+          }
+
+          final combinedPoints = <LatLng>[
+            ...outboundRoute.polylinePoints,
+            ...returnRoute.polylinePoints.skip(1),
+          ];
+
+          final totalDistanceKm =
+              outboundRoute.distanceKm + returnRoute.distanceKm;
+          final totalMinutes =
+              outboundRoute.estimatedMinutes + returnRoute.estimatedMinutes;
+
+          return RouteSuggestion(
+            distanceKm: totalDistanceKm,
+            estimatedMinutes: totalMinutes,
+            points: combinedPoints,
+            directionsRoute: outboundRoute,
+          );
+        }
       }
 
-      // 復路は往路の逆向きを取得
-      final returnRoute = await _fetchDirectionsRoute(
-        origin: destination,
-        destination: center,
-      );
-
-      if (returnRoute == null) {
-        // 復路取得失敗時は往路のみ返す
+      if (fallbackOutbound != null) {
         return RouteSuggestion(
-          distanceKm: outboundRoute.distanceKm,
-          estimatedMinutes: outboundRoute.estimatedMinutes,
-          points: outboundRoute.polylinePoints,
-          directionsRoute: outboundRoute,
+          distanceKm: fallbackOutbound.distanceKm,
+          estimatedMinutes: fallbackOutbound.estimatedMinutes,
+          points: fallbackOutbound.polylinePoints,
+          directionsRoute: fallbackOutbound,
         );
       }
 
-      // 往路と復路を結合
-      final combinedPoints = <LatLng>[
-        ...outboundRoute.polylinePoints,
-        ...returnRoute.polylinePoints.skip(1), // 重複を避ける
-      ];
-
-      final totalDistanceKm =
-          outboundRoute.distanceKm + returnRoute.distanceKm;
-      final totalMinutes =
-          outboundRoute.estimatedMinutes + returnRoute.estimatedMinutes;
-
-      return RouteSuggestion(
-        distanceKm: totalDistanceKm,
-        estimatedMinutes: totalMinutes,
-        points: combinedPoints,
-        directionsRoute: outboundRoute, // 往路をメインに保持
+      throw RouteSuggestionException(
+        type: RouteSuggestionFailureType.noRouteFound,
+        userMessage: '徒歩ルートが見つかりませんでした。距離を短くして再試行してください。',
       );
+    } on RouteSuggestionException {
+      rethrow;
     } catch (e) {
       debugPrint('Error suggesting route: $e');
-      // エラー時は従来の正方形ルートにフォールバック
-      return buildLoop(center: center, distanceKm: distanceKm);
+      throw RouteSuggestionException(
+        type: RouteSuggestionFailureType.unknown,
+        userMessage: 'ルート提案に失敗しました。時間をおいて再試行してください。',
+      );
+    }
+  }
+
+  Future<DirectionsRoute?> _tryFetchRoute({
+    required LatLng origin,
+    required LatLng destination,
+  }) async {
+    try {
+      return await _fetchDirectionsRoute(origin: origin, destination: destination);
+    } on RouteSuggestionException catch (e) {
+      final isRetryable = e.type == RouteSuggestionFailureType.noRouteFound ||
+          e.type == RouteSuggestionFailureType.timeout ||
+          e.type == RouteSuggestionFailureType.network;
+
+      if (isRetryable) {
+        return null;
+      }
+      rethrow;
     }
   }
 
   /// Google Maps Directions API からルート情報を取得
-  Future<DirectionsRoute?> _fetchDirectionsRoute({
+  Future<DirectionsRoute> _fetchDirectionsRoute({
     required LatLng origin,
     required LatLng destination,
   }) async {
@@ -117,45 +170,73 @@ class RouteSuggestionService {
         onTimeout: () => throw TimeoutException('API request timeout'),
       );
 
-      if (response.statusCode == 200) {
-        final json = jsonDecode(response.body) as Map<String, dynamic>;
-        if (json['status'] == 'OK' && (json['routes'] as List).isNotEmpty) {
-          return DirectionsRoute.fromJson(json);
-        } else {
-          debugPrint('Directions API error: ${json['status']}');
-          return null;
-        }
-      } else {
-        debugPrint('HTTP error: ${response.statusCode}');
-        return null;
+      if (response.statusCode != 200) {
+        throw RouteSuggestionException(
+          type: RouteSuggestionFailureType.network,
+          userMessage: '通信エラーが発生しました。ネットワークを確認してください。',
+          rawStatus: 'HTTP_${response.statusCode}',
+        );
       }
+
+      final json = jsonDecode(response.body) as Map<String, dynamic>;
+      final status = json['status'] as String? ?? 'UNKNOWN_ERROR';
+      final routes = json['routes'] as List? ?? const [];
+
+      if (status == 'OK' && routes.isNotEmpty) {
+        return DirectionsRoute.fromJson(json);
+      }
+
+      switch (status) {
+        case 'ZERO_RESULTS':
+          throw RouteSuggestionException(
+            type: RouteSuggestionFailureType.noRouteFound,
+            userMessage: '候補ルートが見つかりませんでした。',
+            rawStatus: status,
+          );
+        case 'OVER_QUERY_LIMIT':
+          throw RouteSuggestionException(
+            type: RouteSuggestionFailureType.quotaExceeded,
+            userMessage: 'API利用上限に達しました。時間をおいて再試行してください。',
+            rawStatus: status,
+          );
+        case 'REQUEST_DENIED':
+          throw RouteSuggestionException(
+            type: RouteSuggestionFailureType.apiKeyDenied,
+            userMessage: 'APIキー設定を確認してください（REQUEST_DENIED）。',
+            rawStatus: status,
+          );
+        case 'INVALID_REQUEST':
+          throw RouteSuggestionException(
+            type: RouteSuggestionFailureType.invalidRequest,
+            userMessage: 'ルートリクエストが不正です。',
+            rawStatus: status,
+          );
+        default:
+          throw RouteSuggestionException(
+            type: RouteSuggestionFailureType.unknown,
+            userMessage: 'ルート提案に失敗しました。時間をおいて再試行してください。',
+            rawStatus: status,
+          );
+      }
+    } on TimeoutException {
+      throw RouteSuggestionException(
+        type: RouteSuggestionFailureType.timeout,
+        userMessage: '通信がタイムアウトしました。時間をおいて再試行してください。',
+      );
+    } on SocketException {
+      throw RouteSuggestionException(
+        type: RouteSuggestionFailureType.network,
+        userMessage: '通信エラーが発生しました。ネットワークを確認してください。',
+      );
+    } on RouteSuggestionException {
+      rethrow;
     } catch (e) {
       debugPrint('Exception fetching directions: $e');
-      return null;
+      throw RouteSuggestionException(
+        type: RouteSuggestionFailureType.unknown,
+        userMessage: 'ルート提案に失敗しました。時間をおいて再試行してください。',
+      );
     }
-  }
-
-  /// 従来の正方形周回ルート（フォールバック用）
-  static RouteSuggestion buildLoop({
-    required LatLng center,
-    required double distanceKm,
-  }) {
-    // 正方形に近い周回ルートを作る（1辺 = 全長の1/4）
-    final segmentKm = distanceKm / 4;
-
-    final p1 = _move(center, segmentKm, 0); // 北
-    final p2 = _move(p1, segmentKm, 90); // 東
-    final p3 = _move(p2, segmentKm, 180); // 南
-    final p4 = _move(p3, segmentKm, 270); // 西
-
-    final points = <LatLng>[center, p1, p2, p3, p4, center];
-    final estimatedMinutes = ((distanceKm / _walkingSpeedKmh) * 60).round();
-
-    return RouteSuggestion(
-      distanceKm: distanceKm,
-      estimatedMinutes: max(1, estimatedMinutes),
-      points: points,
-    );
   }
 
   static LatLng _move(LatLng from, double distanceKm, double bearingDeg) {

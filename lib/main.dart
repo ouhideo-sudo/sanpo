@@ -42,21 +42,15 @@ class SanpoHome extends StatefulWidget {
 }
 
 class _SanpoHomeState extends State<SanpoHome> {
-  static const _autoFinishKey = 'auto_finish_on_suggested_complete';
   late GoogleMapController mapController;
   late RouteService routeService;
   int _currentIndex = 0;
   Set<Polyline> _polylines = {};
   Polyline? _suggestedPolyline;
-  Set<Marker> _suggestionMarkers = {};
   RouteSuggestion? _latestSuggestion;
   double _selectedSuggestionDistanceKm = 2.0;
   bool _isSuggesting = false;
   double? _targetDistanceKm;
-  int _reachedCheckpointCount = 0;
-  final Set<int> _reachedCheckpointIndexes = <int>{};
-  bool _suggestedRouteCompleted = false;
-  bool _autoFinishOnSuggestedComplete = true;
   final List<LatLng> _currentRoute = [];
   bool _isRecording = false;
   DateTime? _recordingStartTime;
@@ -65,17 +59,8 @@ class _SanpoHomeState extends State<SanpoHome> {
   void initState() {
     super.initState();
     routeService = RouteService(widget.prefs);
-    _autoFinishOnSuggestedComplete =
-        widget.prefs.getBool(_autoFinishKey) ?? true;
     _requestLocationPermission();
     _loadSavedRoutes();
-  }
-
-  Future<void> _setAutoFinishOnSuggestedComplete(bool value) async {
-    setState(() {
-      _autoFinishOnSuggestedComplete = value;
-    });
-    await widget.prefs.setBool(_autoFinishKey, value);
   }
 
   Future<void> _loadSavedRoutes() async {
@@ -134,9 +119,6 @@ class _SanpoHomeState extends State<SanpoHome> {
     setState(() {
       _isRecording = true;
       _targetDistanceKm = targetDistanceKm;
-      _reachedCheckpointCount = 0;
-      _reachedCheckpointIndexes.clear();
-      _suggestedRouteCompleted = false;
       _currentRoute.clear();
       _recordingStartTime = DateTime.now();
     });
@@ -163,12 +145,10 @@ class _SanpoHomeState extends State<SanpoHome> {
 
   Future<void> _stopRouteRecording() async {
     final wasSuggestedRoute = _targetDistanceKm != null;
-    final suggestedCompleted = _suggestedRouteCompleted;
 
     setState(() {
       _isRecording = false;
       _targetDistanceKm = null;
-      _suggestedRouteCompleted = false;
     });
 
     if (_currentRoute.isNotEmpty && _recordingStartTime != null) {
@@ -184,7 +164,7 @@ class _SanpoHomeState extends State<SanpoHome> {
         distanceKm: distanceKm,
         durationMinutes: durationMinutes,
         isSuggested: wasSuggestedRoute,
-        isSuggestedCompleted: suggestedCompleted,
+        isSuggestedCompleted: false,
       );
 
       await routeService.saveRoute(route);
@@ -219,68 +199,10 @@ class _SanpoHomeState extends State<SanpoHome> {
 
     final position = await Geolocator.getCurrentPosition();
     final latLng = LatLng(position.latitude, position.longitude);
-    var completedNow = false;
-
     if (mounted) {
-      final newlyReached = _findNewlyReachedCheckpoints(
-        suggestionPoints: _latestSuggestion?.points,
-        walkedPoint: latLng,
-      );
-
       setState(() {
         _currentRoute.add(latLng);
-        if (_latestSuggestion != null && _targetDistanceKm != null) {
-          _reachedCheckpointIndexes.addAll(newlyReached);
-          _reachedCheckpointCount = _reachedCheckpointIndexes.length;
-          _suggestionMarkers = _buildSuggestionMarkers(_latestSuggestion!.points);
-
-          final justReachedGoal = !_suggestedRouteCompleted &&
-              _reachedCheckpointCount >= 4 &&
-              _isNearSuggestionStart(
-                suggestionPoints: _latestSuggestion!.points,
-                currentPoint: latLng,
-              );
-          if (justReachedGoal) {
-            _suggestedRouteCompleted = true;
-            completedNow = true;
-          }
-        }
       });
-
-      if (newlyReached.isNotEmpty) {
-        final sorted = newlyReached.toList()..sort();
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Text('チェックポイント ${sorted.join(', ')} に到達！'),
-              duration: const Duration(seconds: 1),
-            ),
-          );
-        }
-      }
-
-      if (completedNow && mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('提案ルート完歩！おつかれさまでした。'),
-            duration: Duration(seconds: 2),
-          ),
-        );
-
-        if (_autoFinishOnSuggestedComplete && _isRecording) {
-          await _stopRouteRecording();
-          if (!mounted) {
-            return;
-          }
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(
-              content: Text('オートフィニッシュ: 記録を自動保存しました。'),
-              duration: Duration(seconds: 2),
-            ),
-          );
-          return;
-        }
-      }
     }
 
     // 次の更新を1秒後に予約
@@ -292,11 +214,7 @@ class _SanpoHomeState extends State<SanpoHome> {
     setState(() {
       _polylines.clear();
       _suggestedPolyline = null;
-      _suggestionMarkers = {};
       _latestSuggestion = null;
-      _reachedCheckpointCount = 0;
-      _reachedCheckpointIndexes.clear();
-      _suggestedRouteCompleted = false;
       _currentRoute.clear();
     });
   }
@@ -307,24 +225,18 @@ class _SanpoHomeState extends State<SanpoHome> {
     });
 
     try {
+      final mapsApiKey = await ApiKeys.getMapsApiKey();
+      if (mapsApiKey.isEmpty) {
+        throw Exception('MAPS_API_KEY が未設定です。実ルート提案を利用するには API キーを設定してください。');
+      }
+
       final position = await Geolocator.getCurrentPosition();
       final current = LatLng(position.latitude, position.longitude);
-
-      RouteSuggestion suggestion;
-      if (ApiKeys.isConfigured) {
-        // Google Maps Directions API を使用
-        final service = RouteSuggestionService(mapsApiKey: ApiKeys.mapsApiKey);
-        suggestion = await service.suggestLoopRoute(
-          center: current,
-          distanceKm: _selectedSuggestionDistanceKm,
-        );
-      } else {
-        // API キー未設定時は従来の正方形ルート
-        suggestion = RouteSuggestionService.buildLoop(
-          center: current,
-          distanceKm: _selectedSuggestionDistanceKm,
-        );
-      }
+      final service = RouteSuggestionService(mapsApiKey: mapsApiKey);
+      final suggestion = await service.suggestLoopRoute(
+        center: current,
+        distanceKm: _selectedSuggestionDistanceKm,
+      );
 
       final polyline = Polyline(
         polylineId: const PolylineId('suggested-route'),
@@ -339,21 +251,20 @@ class _SanpoHomeState extends State<SanpoHome> {
 
       if (mounted) {
         setState(() {
-          _reachedCheckpointCount = 0;
-          _reachedCheckpointIndexes.clear();
           _latestSuggestion = suggestion;
           _suggestedPolyline = polyline;
-          _suggestionMarkers = _buildSuggestionMarkers(suggestion.points);
-          _suggestedRouteCompleted = false;
         });
 
         final bounds = _computeBounds(suggestion.points);
         mapController.animateCamera(CameraUpdate.newLatLngBounds(bounds, 64));
       }
     } catch (e) {
+      final message = e is RouteSuggestionException
+          ? e.userMessage
+          : 'ルート提案の作成に失敗しました。時間をおいて再試行してください。';
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('ルート提案の作成に失敗しました: $e')),
+          SnackBar(content: Text(message)),
         );
       }
     } finally {
@@ -382,73 +293,6 @@ class _SanpoHomeState extends State<SanpoHome> {
       southwest: LatLng(minLat, minLng),
       northeast: LatLng(maxLat, maxLng),
     );
-  }
-
-  Set<Marker> _buildSuggestionMarkers(List<LatLng> points) {
-    // 先頭と末尾は同地点（スタート/ゴール）なので、チェックポイントは中間4点
-    final markers = <Marker>{};
-    for (int i = 1; i <= 4 && i < points.length - 1; i++) {
-      markers.add(
-        Marker(
-          markerId: MarkerId('cp-$i'),
-          position: points[i],
-          infoWindow: InfoWindow(title: 'チェックポイント $i'),
-          icon: BitmapDescriptor.defaultMarkerWithHue(
-            _reachedCheckpointIndexes.contains(i)
-                ? BitmapDescriptor.hueGreen
-                : BitmapDescriptor.hueAzure,
-          ),
-        ),
-      );
-    }
-    return markers;
-  }
-
-  Set<int> _findNewlyReachedCheckpoints({
-    required List<LatLng>? suggestionPoints,
-    required LatLng walkedPoint,
-  }) {
-    if (suggestionPoints == null || suggestionPoints.length < 3) {
-      return <int>{};
-    }
-
-    final reached = <int>{};
-    for (int i = 1; i <= 4 && i < suggestionPoints.length - 1; i++) {
-      if (_reachedCheckpointIndexes.contains(i)) {
-        continue;
-      }
-
-      final checkpoint = suggestionPoints[i];
-      final meters = Geolocator.distanceBetween(
-        checkpoint.latitude,
-        checkpoint.longitude,
-        walkedPoint.latitude,
-        walkedPoint.longitude,
-      );
-      final isReached = meters <= 35;
-      if (isReached) {
-        reached.add(i);
-      }
-    }
-    return reached;
-  }
-
-  bool _isNearSuggestionStart({
-    required List<LatLng> suggestionPoints,
-    required LatLng currentPoint,
-  }) {
-    if (suggestionPoints.isEmpty) {
-      return false;
-    }
-
-    final start = suggestionPoints.first;
-    final meters = Geolocator.distanceBetween(
-      start.latitude,
-      start.longitude,
-      currentPoint.latitude,
-      currentPoint.longitude,
-    );
-    return meters <= 45;
   }
 
   @override
@@ -498,6 +342,10 @@ class _SanpoHomeState extends State<SanpoHome> {
   }
 
   Widget _buildMapPage() {
+    final isSuggestionSupportedPlatform =
+      ApiKeys.isRouteSuggestionSupportedPlatform;
+    final canSuggest =
+      isSuggestionSupportedPlatform && !_isSuggesting && !_isRecording;
     final liveDistanceKm = _currentRoute.length > 1
         ? RouteService.calculateTotalDistance(_currentRoute)
         : 0.0;
@@ -506,7 +354,6 @@ class _SanpoHomeState extends State<SanpoHome> {
         : '${liveDistanceKm.toStringAsFixed(2)} km';
 
     final displayedPolylines = <Polyline>{..._polylines};
-    final displayedMarkers = <Marker>{..._suggestionMarkers};
     if (_suggestedPolyline != null) {
       displayedPolylines.add(_suggestedPolyline!);
     }
@@ -523,7 +370,6 @@ class _SanpoHomeState extends State<SanpoHome> {
             zoom: 15,
           ),
           polylines: displayedPolylines,
-          markers: displayedMarkers,
           myLocationEnabled: true,
           myLocationButtonEnabled: true,
           zoomControlsEnabled: true,
@@ -561,26 +407,30 @@ class _SanpoHomeState extends State<SanpoHome> {
                   ),
                   const SizedBox(height: 8),
                   FilledButton.icon(
-                    onPressed: (_isSuggesting || _isRecording) ? null : _suggestRoute,
-                    icon: (_isSuggesting || _isRecording)
+                    onPressed: canSuggest ? _suggestRoute : null,
+                    icon: _isSuggesting
                         ? const SizedBox(
                             width: 16,
                             height: 16,
                             child: CircularProgressIndicator(strokeWidth: 2),
                           )
                         : const Icon(Icons.route),
-                    label: Text(_isSuggesting ? '提案中...' : 'この距離で提案'),
+                    label: Text(
+                      _isSuggesting
+                          ? '提案中...'
+                          : isSuggestionSupportedPlatform
+                              ? 'この距離で提案'
+                              : 'Android端末で利用可',
+                    ),
                   ),
-                  const SizedBox(height: 8),
-                  Row(
-                    children: [
-                      const Expanded(child: Text('完歩時に自動保存（オートフィニッシュ）')),
-                      Switch(
-                        value: _autoFinishOnSuggestedComplete,
-                        onChanged: _setAutoFinishOnSuggestedComplete,
+                  if (!isSuggestionSupportedPlatform)
+                    const Padding(
+                      padding: EdgeInsets.only(top: 8),
+                      child: Text(
+                        '道路ベースの提案はAndroidアプリで利用できます。',
+                        style: TextStyle(color: Colors.black54),
                       ),
-                    ],
-                  ),
+                    ),
                   if (_latestSuggestion != null)
                     Padding(
                       padding: const EdgeInsets.only(top: 8),
@@ -604,11 +454,7 @@ class _SanpoHomeState extends State<SanpoHome> {
                     Padding(
                       padding: const EdgeInsets.only(top: 8),
                       child: Text(
-                        _targetDistanceKm != null
-                            ? _suggestedRouteCompleted
-                                ? '完歩達成！ $progressText | CP $_reachedCheckpointCount/4'
-                                : '記録中: $progressText | CP $_reachedCheckpointCount/4'
-                            : '記録中: $progressText',
+                        '記録中: $progressText',
                         style: const TextStyle(fontWeight: FontWeight.w600),
                       ),
                     ),

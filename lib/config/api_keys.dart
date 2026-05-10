@@ -1,17 +1,19 @@
-/// Google Maps API 設定
-/// 
-/// local.properties から読み込まれる値を保持する
-class ApiKeys {
-  /// Google Maps Directions API キー
-  /// 
-  /// 設定方法：
-  /// 1. android/local.properties に `MAPS_API_KEY=<your-key>` を追加
-  /// 2. ビルド実行時に build.gradle.kts がこのファイルを生成
-  static const String mapsApiKey = String.fromEnvironment(
-    'MAPS_API_KEY',
-    defaultValue: '',
-  );
+import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 
-  /// API キーが設定されているか
-  static bool get isConfigured => mapsApiKey.isNotEmpty;
+/// Android Manifest から API キーを取得する
+class ApiKeys {
+  static const MethodChannel _channel = MethodChannel('sanpo/config');
+
+  static bool get isRouteSuggestionSupportedPlatform =>
+      !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
+
+  static Future<String> getMapsApiKey() async {
+    if (!isRouteSuggestionSupportedPlatform) {
+      return '';
+    }
+
+    final key = await _channel.invokeMethod<String>('getMapsApiKey');
+    return key?.trim() ?? '';
+  }
 }
