@@ -56,6 +56,7 @@ class _SanpoHomeState extends State<SanpoHome> {
   Marker? _destinationMarker;
   double _selectedSuggestionDistanceKm = 2.0;
   bool _isSuggesting = false;
+  bool _isDestinationSelectionMode = false;
   double? _targetDistanceKm;
   final List<LatLng> _currentRoute = [];
   bool _isRecording = false;
@@ -122,6 +123,7 @@ class _SanpoHomeState extends State<SanpoHome> {
     setState(() {
       _suggestedDestination = null;
       _destinationMarker = null;
+      _isDestinationSelectionMode = false;
     });
     _startRouteRecording();
   }
@@ -132,6 +134,9 @@ class _SanpoHomeState extends State<SanpoHome> {
     }
 
     _startRouteRecording(targetDistanceKm: _latestSuggestion!.distanceKm);
+    setState(() {
+      _isDestinationSelectionMode = false;
+    });
     if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
@@ -150,6 +155,7 @@ class _SanpoHomeState extends State<SanpoHome> {
     setState(() {
       _isRecording = false;
       _targetDistanceKm = null;
+      _isDestinationSelectionMode = false;
     });
 
     if (_currentRoute.isNotEmpty && _recordingStartTime != null) {
@@ -403,6 +409,94 @@ class _SanpoHomeState extends State<SanpoHome> {
     return meters <= _destinationArrivalThresholdMeters;
   }
 
+  void _toggleDestinationSelectionMode() {
+    if (!_isRecording || _targetDistanceKm == null) {
+      return;
+    }
+
+    setState(() {
+      _isDestinationSelectionMode = !_isDestinationSelectionMode;
+    });
+
+    if (_isDestinationSelectionMode && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('地図をタップして新しい目的地を設定してください。'),
+          duration: Duration(seconds: 2),
+        ),
+      );
+    }
+  }
+
+  Future<void> _updateDestination(LatLng destination) async {
+    setState(() {
+      _suggestedDestination = destination;
+      _destinationMarker = Marker(
+        markerId: const MarkerId('suggested-destination'),
+        position: destination,
+        infoWindow: const InfoWindow(title: '目的地'),
+      );
+      _isDestinationSelectionMode = false;
+    });
+
+    try {
+      final mapsApiKey = await ApiKeys.getMapsApiKey();
+      if (mapsApiKey.isEmpty) {
+        throw RouteSuggestionException(
+          type: RouteSuggestionFailureType.apiKeyDenied,
+          userMessage: 'MAPS_API_KEY が未設定です。',
+        );
+      }
+
+      final position = await Geolocator.getCurrentPosition();
+      final origin = LatLng(position.latitude, position.longitude);
+      final service = RouteSuggestionService(mapsApiKey: mapsApiKey);
+      final suggestion = await service.suggestRouteToDestination(
+        origin: origin,
+        destination: destination,
+      );
+
+      final polyline = Polyline(
+        polylineId: const PolylineId('suggested-route'),
+        points: suggestion.points,
+        color: Colors.pink,
+        width: 4,
+        patterns: <PatternItem>[
+          PatternItem.dash(20),
+          PatternItem.gap(12),
+        ],
+      );
+
+      if (mounted) {
+        setState(() {
+          _latestSuggestion = suggestion;
+          _suggestedPolyline = polyline;
+          if (_targetDistanceKm != null) {
+            _targetDistanceKm = suggestion.distanceKm;
+          }
+        });
+
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              '目的地を更新しました。新ルート: ${suggestion.distanceKm.toStringAsFixed(1)}km',
+            ),
+            duration: const Duration(seconds: 2),
+          ),
+        );
+      }
+    } catch (e) {
+      final message = e is RouteSuggestionException
+          ? e.userMessage
+          : '目的地更新後のルート提案に失敗しました。';
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(message)),
+        );
+      }
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final pages = <Widget>[
@@ -476,6 +570,11 @@ class _SanpoHomeState extends State<SanpoHome> {
           onMapCreated: (controller) {
             mapController = controller;
             _getCurrentLocation();
+          },
+          onTap: (point) {
+            if (_isRecording && _targetDistanceKm != null && _isDestinationSelectionMode) {
+              _updateDestination(point);
+            }
           },
           initialCameraPosition: const CameraPosition(
             target: LatLng(35.6762, 139.6503), // 東京
@@ -588,9 +687,31 @@ class _SanpoHomeState extends State<SanpoHome> {
                   if (_isRecording)
                     Padding(
                       padding: const EdgeInsets.only(top: 8),
-                      child: Text(
-                        '記録中: $progressText',
-                        style: const TextStyle(fontWeight: FontWeight.w600),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            '記録中: $progressText',
+                            style: const TextStyle(fontWeight: FontWeight.w600),
+                          ),
+                          if (_targetDistanceKm != null)
+                            Padding(
+                              padding: const EdgeInsets.only(top: 8),
+                              child: OutlinedButton.icon(
+                                onPressed: _toggleDestinationSelectionMode,
+                                icon: Icon(
+                                  _isDestinationSelectionMode
+                                      ? Icons.close
+                                      : Icons.edit_location_alt,
+                                ),
+                                label: Text(
+                                  _isDestinationSelectionMode
+                                      ? '目的地変更をキャンセル'
+                                      : '目的地を変更',
+                                ),
+                              ),
+                            ),
+                        ],
                       ),
                     ),
                 ],

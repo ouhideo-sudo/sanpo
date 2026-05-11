@@ -54,6 +54,33 @@ class RouteSuggestionService {
 
   RouteSuggestionService({required this.mapsApiKey});
 
+  Future<RouteSuggestion> suggestRouteToDestination({
+    required LatLng origin,
+    required LatLng destination,
+  }) async {
+    try {
+      final route = await _fetchDirectionsRoute(
+        origin: origin,
+        destination: destination,
+      );
+
+      return RouteSuggestion(
+        distanceKm: route.distanceKm,
+        estimatedMinutes: route.estimatedMinutes,
+        points: route.polylinePoints,
+        directionsRoute: route,
+      );
+    } on RouteSuggestionException {
+      rethrow;
+    } catch (e) {
+      debugPrint('Error suggesting route to destination: $e');
+      throw RouteSuggestionException(
+        type: RouteSuggestionFailureType.unknown,
+        userMessage: '変更先目的地へのルート提案に失敗しました。',
+      );
+    }
+  }
+
   /// Google Maps Directions API を使用して周回ルートを提案
   /// [center]: 現在地
   /// [distanceKm]: 希望距離
