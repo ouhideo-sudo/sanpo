@@ -84,9 +84,11 @@ class RouteSuggestionService {
   /// Google Maps Directions API を使用して周回ルートを提案
   /// [center]: 現在地
   /// [distanceKm]: 希望距離
+  /// [recordedRoutes]: 既に歩いたルート（重複を避けるため）
   Future<RouteSuggestion> suggestLoopRoute({
     required LatLng center,
     required double distanceKm,
+    List<List<LatLng>>? recordedRoutes,
   }) async {
     try {
       // 方位と半径を段階的に変えて候補を試し、提案成功率を上げる
@@ -104,6 +106,8 @@ class RouteSuggestionService {
           final outboundRoute = await _tryFetchRoute(
             origin: center,
             destination: destination,
+            useAlternatives: true,
+            recordedRoutes: recordedRoutes,
           );
           if (outboundRoute == null) {
             continue;
@@ -113,6 +117,7 @@ class RouteSuggestionService {
           final returnRoute = await _tryFetchRoute(
             origin: destination,
             destination: center,
+            useAlternatives: false,
           );
           if (returnRoute == null) {
             continue;
@@ -164,9 +169,16 @@ class RouteSuggestionService {
   Future<DirectionsRoute?> _tryFetchRoute({
     required LatLng origin,
     required LatLng destination,
+    bool useAlternatives = false,
+    List<List<LatLng>>? recordedRoutes,
   }) async {
     try {
-      return await _fetchDirectionsRoute(origin: origin, destination: destination);
+      return await _fetchDirectionsRoute(
+        origin: origin,
+        destination: destination,
+        useAlternatives: useAlternatives,
+        recordedRoutes: recordedRoutes,
+      );
     } on RouteSuggestionException catch (e) {
       final isRetryable = e.type == RouteSuggestionFailureType.noRouteFound ||
           e.type == RouteSuggestionFailureType.timeout ||
@@ -183,13 +195,17 @@ class RouteSuggestionService {
   Future<DirectionsRoute> _fetchDirectionsRoute({
     required LatLng origin,
     required LatLng destination,
+    bool useAlternatives = false,
+    List<List<LatLng>>? recordedRoutes,
   }) async {
     try {
+      final alternativesParam = useAlternatives ? 'true' : 'false';
       final String url =
           'https://maps.googleapis.com/maps/api/directions/json'
           '?origin=${origin.latitude},${origin.longitude}'
           '&destination=${destination.latitude},${destination.longitude}'
           '&mode=walking'
+          '&alternatives=$alternativesParam'
           '&key=$mapsApiKey';
 
       final response = await http.get(Uri.parse(url)).timeout(
@@ -210,7 +226,13 @@ class RouteSuggestionService {
       final routes = json['routes'] as List? ?? const [];
 
       if (status == 'OK' && routes.isNotEmpty) {
-        return DirectionsRoute.fromJson(json);
+        // alternatives=true の場合、複数ルート候補から最適なものを選ぶ
+        if (useAlternatives && recordedRoutes != null && recordedRoutes.isNotEmpty) {
+          return _selectBestRoute(json, recordedRoutes);
+        } else {
+          // alternatives=false または記録ルートなし：最初のルートを返す
+          return DirectionsRoute.fromJson(json);
+        }
       }
 
       switch (status) {
@@ -264,6 +286,46 @@ class RouteSuggestionService {
         userMessage: 'ルート提案に失敗しました。時間をおいて再試行してください。',
       );
     }
+  }
+
+  /// 複数ルート候補の中から最適なものを選ぶ（最も重複度が低いもの）
+  DirectionsRoute _selectBestRoute(
+    Map<String, dynamic> json,
+    List<List<LatLng>> recordedRoutes,
+  ) {
+    final routes = json['routes'] as List;
+    if (routes.isEmpty) {
+      throw RouteSuggestionException(
+        type: RouteSuggestionFailureType.noRouteFound,
+        userMessage: '候補ルートが見つかりませんでした。',
+      );
+    }
+
+    late DirectionsRoute bestRoute;
+    double minOverlap = double.infinity;
+
+    for (final routeJson in routes) {
+      final route = DirectionsRoute.fromJson({
+        'routes': [routeJson],
+        'status': 'OK',
+      });
+
+      double totalOverlap = 0;
+      for (final recordedRoute in recordedRoutes) {
+        final overlap = DirectionsRouteAlternatives.calculateRouteOverlap(
+          route.polylinePoints,
+          recordedRoute,
+        );
+        totalOverlap += overlap;
+      }
+
+      if (totalOverlap < minOverlap) {
+        minOverlap = totalOverlap;
+        bestRoute = route;
+      }
+    }
+
+    return bestRoute;
   }
 
   static LatLng _move(LatLng from, double distanceKm, double bearingDeg) {

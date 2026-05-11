@@ -264,26 +264,6 @@ class _SanpoHomeState extends State<SanpoHome> {
     _trackPosition();
   }
 
-  Future<void> _clearRoutes() async {
-    await routeService.deleteAllRoutes();
-    if (!mounted) {
-      return;
-    }
-
-    setState(() {
-      _savedRoutes = [];
-      _suggestedPolyline = null;
-      _latestSuggestion = null;
-      _suggestedDestination = null;
-      _destinationMarker = null;
-      _currentRoute.clear();
-    });
-
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('保存済みルートを削除しました')),
-    );
-  }
-
   Future<void> _suggestRoute() async {
     setState(() {
       _isSuggesting = true;
@@ -297,10 +277,19 @@ class _SanpoHomeState extends State<SanpoHome> {
 
       final position = await Geolocator.getCurrentPosition();
       final current = LatLng(position.latitude, position.longitude);
+      
+      // 既に歩いたルートを取得（重複を避けるため）
+      final recordedRoutes = <List<LatLng>>[];
+      final routes = await routeService.getRoutes();
+      for (final route in routes) {
+        recordedRoutes.add(route.points);
+      }
+      
       final service = RouteSuggestionService(mapsApiKey: mapsApiKey);
       final suggestion = await service.suggestLoopRoute(
         center: current,
         distanceKm: _selectedSuggestionDistanceKm,
+        recordedRoutes: recordedRoutes.isNotEmpty ? recordedRoutes : null,
       );
       final destination = _selectDestinationPoint(
         points: suggestion.points,
@@ -723,24 +712,15 @@ class _SanpoHomeState extends State<SanpoHome> {
           bottom: 20,
           left: 20,
           right: 20,
-          child: Row(
-            mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-            children: [
-              FloatingActionButton.extended(
-                onPressed: _isRecording
-                    ? _stopRouteRecording
-                    : _startRegularWalk,
-                label: Text(_isRecording ? '停止' : '開始'),
-                icon: Icon(_isRecording ? Icons.stop : Icons.play_arrow),
-                backgroundColor: _isRecording ? Colors.red : Colors.green,
-              ),
-              if (_savedRoutes.isNotEmpty || _suggestedPolyline != null)
-                FloatingActionButton(
-                  onPressed: () => _clearRoutes(),
-                  backgroundColor: Colors.grey,
-                  child: const Icon(Icons.delete_outline),
-                ),
-            ],
+          child: Center(
+            child: FloatingActionButton.extended(
+              onPressed: _isRecording
+                  ? _stopRouteRecording
+                  : _startRegularWalk,
+              label: Text(_isRecording ? '停止' : '開始'),
+              icon: Icon(_isRecording ? Icons.stop : Icons.play_arrow),
+              backgroundColor: _isRecording ? Colors.red : Colors.green,
+            ),
           ),
         ),
       ],
@@ -827,9 +807,30 @@ class _RoutesHistoryPageState extends State<RoutesHistoryPage> {
               trailing: IconButton(
                 icon: const Icon(Icons.delete, color: Colors.red),
                 onPressed: () async {
-                  await routeService.deleteRoute(route.id);
-                  widget.onRouteDeleted();
-                  setState(() {});
+                  final confirmed = await showDialog<bool>(
+                    context: context,
+                    builder: (BuildContext context) {
+                      return AlertDialog(
+                        title: const Text('ルートを削除'),
+                        content: const Text('本当に削除しますか？'),
+                        actions: [
+                          TextButton(
+                            onPressed: () => Navigator.of(context).pop(false),
+                            child: const Text('キャンセル'),
+                          ),
+                          TextButton(
+                            onPressed: () => Navigator.of(context).pop(true),
+                            child: const Text('削除'),
+                          ),
+                        ],
+                      );
+                    },
+                  );
+                  if (confirmed == true) {
+                    await routeService.deleteRoute(route.id);
+                    widget.onRouteDeleted();
+                    setState(() {});
+                  }
                 },
               ),
             );

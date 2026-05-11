@@ -1,4 +1,5 @@
 import 'package:google_maps_flutter/google_maps_flutter.dart';
+import 'dart:math';
 
 /// Google Maps Directions API のレスポンスから構築するルート情報
 class DirectionsRoute {
@@ -185,5 +186,148 @@ class RouteStep {
         .replaceAll('&gt;', '>')
         .replaceAll('&quot;', '"')
         .replaceAll('&#39;', "'");
+  }
+}
+
+/// 複数のルート代替案を保持するクラス（Directions API の alternatives 対応）
+class DirectionsRouteAlternatives {
+  DirectionsRouteAlternatives({
+    required this.routes,
+  });
+
+  /// 複数のルート候補
+  final List<DirectionsRoute> routes;
+
+  /// 最初のルートを返す（互換性保持）
+  DirectionsRoute get primaryRoute => routes.first;
+
+  /// JSON からのファクトリコンストラクタ（複数ルート対応）
+  factory DirectionsRouteAlternatives.fromJson(Map<String, dynamic> json) {
+    final routeList = (json['routes'] as List?)
+            ?.map((route) => _parseRoute(route as Map<String, dynamic>))
+            .toList() ??
+        [];
+
+    if (routeList.isEmpty) {
+      throw Exception('No routes found in Directions API response');
+    }
+
+    return DirectionsRouteAlternatives(routes: routeList);
+  }
+
+  /// Polyline format をデコード (encoded polyline から LatLng 列に変換)
+  static List<LatLng> _decodePolyline(String encoded) {
+    final points = <LatLng>[];
+    int index = 0, lat = 0, lng = 0;
+
+    while (index < encoded.length) {
+      int result = 0;
+      int shift = 0;
+
+      int b;
+      do {
+        b = encoded.codeUnitAt(index++) - 63;
+        result |= (b & 0x1f) << shift;
+        shift += 5;
+      } while (b >= 0x20);
+
+      final dlat = (result & 1) != 0 ? ~(result >> 1) : (result >> 1);
+      lat += dlat;
+
+      result = 0;
+      shift = 0;
+
+      do {
+        b = encoded.codeUnitAt(index++) - 63;
+        result |= (b & 0x1f) << shift;
+        shift += 5;
+      } while (b >= 0x20);
+
+      final dlng = (result & 1) != 0 ? ~(result >> 1) : (result >> 1);
+      lng += dlng;
+
+      points.add(LatLng(lat / 1e5, lng / 1e5));
+    }
+
+    return points;
+  }
+
+  /// 個別ルートをパース
+  static DirectionsRoute _parseRoute(Map<String, dynamic> route) {
+    final legs = (route['legs'] as List)
+        .map((leg) => RouteLeg.fromJson(leg as Map<String, dynamic>))
+        .toList();
+
+    final polylineString = route['overview_polyline']['points'] as String;
+    final polylinePoints = _decodePolyline(polylineString);
+
+    return DirectionsRoute(
+      summary: route['summary'] as String? ?? '',
+      polylinePoints: polylinePoints,
+      legs: legs,
+      distanceMeters: (route['legs'] as List)
+          .fold(0, (sum, leg) => sum + (leg['distance']['value'] as int? ?? 0)),
+      durationSeconds: (route['legs'] as List)
+          .fold(0, (sum, leg) => sum + (leg['duration']['value'] as int? ?? 0)),
+    );
+  }
+
+  /// ルートの重複度を計算（メートル）
+  /// 50m以内の近接距離を重複と判定
+  static double calculateRouteOverlap(
+    List<LatLng> candidateRoute,
+    List<LatLng> recordedRoute,
+    {double proximityThresholdMeters = 50.0}
+  ) {
+    double overlapDistance = 0.0;
+
+    for (int i = 0; i < candidateRoute.length - 1; i++) {
+      final p1 = candidateRoute[i];
+      final p2 = candidateRoute[i + 1];
+
+      for (int j = 0; j < recordedRoute.length - 1; j++) {
+        final q1 = recordedRoute[j];
+        final q2 = recordedRoute[j + 1];
+
+        final minDist = _minDistanceBetweenSegments(p1, p2, q1, q2);
+        if (minDist <= proximityThresholdMeters) {
+          // セグメント間の距離
+          overlapDistance += _haversineDistance(p1, p2) * 1000; // km to meter
+        }
+      }
+    }
+
+    return overlapDistance;
+  }
+
+  /// 2つの線分（大圏コース）の最小距離を計算（メートル）
+  static double _minDistanceBetweenSegments(
+    LatLng p1,
+    LatLng p2,
+    LatLng q1,
+    LatLng q2,
+  ) {
+    // 各点の距離を計算
+    final d1 = _haversineDistance(p1, q1) * 1000;
+    final d2 = _haversineDistance(p1, q2) * 1000;
+    final d3 = _haversineDistance(p2, q1) * 1000;
+    final d4 = _haversineDistance(p2, q2) * 1000;
+
+    return [d1, d2, d3, d4].reduce((a, b) => a < b ? a : b);
+  }
+
+  /// Haversine 公式で距離を計算（km）
+  static double _haversineDistance(LatLng p1, LatLng p2) {
+    const R = 6371; // 地球の半径（km）
+    final lat1 = p1.latitude * pi / 180;
+    final lat2 = p2.latitude * pi / 180;
+    final deltaLat = (p2.latitude - p1.latitude) * pi / 180;
+    final deltaLng = (p2.longitude - p1.longitude) * pi / 180;
+
+    final a = sin(deltaLat / 2) * sin(deltaLat / 2) +
+        cos(lat1) * cos(lat2) * sin(deltaLng / 2) * sin(deltaLng / 2);
+    final c = 2 * atan2(sqrt(a), sqrt(1 - a));
+
+    return R * c;
   }
 }
