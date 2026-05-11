@@ -43,6 +43,7 @@ class SanpoHome extends StatefulWidget {
 
 class _SanpoHomeState extends State<SanpoHome> {
   static const double _destinationArrivalThresholdMeters = 35;
+  static const double _polygonCloseThresholdKm = 0.08;
 
   late GoogleMapController mapController;
   late RouteService routeService;
@@ -50,6 +51,7 @@ class _SanpoHomeState extends State<SanpoHome> {
   List<WalkRoute> _savedRoutes = [];
   bool _showSuggestedWalkRoutes = true;
   bool _showRegularWalkRoutes = true;
+  bool _showEnclosedAreas = true;
   Polyline? _suggestedPolyline;
   RouteSuggestion? _latestSuggestion;
   LatLng? _suggestedDestination;
@@ -221,6 +223,44 @@ class _SanpoHomeState extends State<SanpoHome> {
     return polylines;
   }
 
+  Set<Polygon> _buildSavedRoutePolygons() {
+    final polygons = <Polygon>{};
+    for (final route in _savedRoutes) {
+      if (route.isSuggested && !_showSuggestedWalkRoutes) {
+        continue;
+      }
+      if (!route.isSuggested && !_showRegularWalkRoutes) {
+        continue;
+      }
+      if (!_isClosedRoute(route.points)) {
+        continue;
+      }
+
+      final baseColor = route.isSuggested
+          ? (route.isSuggestedCompleted ? Colors.teal : Colors.deepOrange)
+          : Colors.blue;
+
+      polygons.add(
+        Polygon(
+          polygonId: PolygonId('area-${route.id}'),
+          points: route.points,
+          strokeColor: baseColor.withAlpha(110),
+          strokeWidth: 1,
+          fillColor: baseColor.withAlpha(45),
+        ),
+      );
+    }
+    return polygons;
+  }
+
+  bool _isClosedRoute(List<LatLng> points) {
+    if (points.length < 3) {
+      return false;
+    }
+    final distanceKm = RouteService.calculateDistance(points.first, points.last);
+    return distanceKm <= _polygonCloseThresholdKm;
+  }
+
   void _toggleSuggestedFilter(bool value) {
     setState(() {
       _showSuggestedWalkRoutes = value;
@@ -230,6 +270,12 @@ class _SanpoHomeState extends State<SanpoHome> {
   void _toggleRegularFilter(bool value) {
     setState(() {
       _showRegularWalkRoutes = value;
+    });
+  }
+
+  void _toggleEnclosedAreaFilter(bool value) {
+    setState(() {
+      _showEnclosedAreas = value;
     });
   }
 
@@ -545,6 +591,9 @@ class _SanpoHomeState extends State<SanpoHome> {
         : '${liveDistanceKm.toStringAsFixed(2)} km';
 
     final displayedPolylines = _buildSavedRoutePolylines();
+    final displayedPolygons = _showEnclosedAreas
+      ? _buildSavedRoutePolygons()
+      : <Polygon>{};
     final displayedMarkers = <Marker>{};
     if (_destinationMarker != null) {
       displayedMarkers.add(_destinationMarker!);
@@ -570,6 +619,7 @@ class _SanpoHomeState extends State<SanpoHome> {
             zoom: 15,
           ),
           polylines: displayedPolylines,
+          polygons: displayedPolygons,
           markers: displayedMarkers,
           myLocationEnabled: true,
           myLocationButtonEnabled: true,
@@ -620,6 +670,11 @@ class _SanpoHomeState extends State<SanpoHome> {
                         label: const Text('通常散歩を表示'),
                         selected: _showRegularWalkRoutes,
                         onSelected: _toggleRegularFilter,
+                      ),
+                      FilterChip(
+                        label: const Text('囲みエリアを表示'),
+                        selected: _showEnclosedAreas,
+                        onSelected: _toggleEnclosedAreaFilter,
                       ),
                     ],
                   ),
