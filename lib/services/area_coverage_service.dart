@@ -113,8 +113,16 @@ class AreaCoverageService {
 
         // 内部面のみ保持（CCW = 符号付き面積 > 0）。外部無限面は CW で負になる。
         final signedArea = _signedPolygonAreaSqKm(faceNodes);
-        if (signedArea <= 0) continue;
-        if (signedArea < _minPolygonAreaSqKm) continue;
+        print('[DEBUG] 面検出: ノード数=${faceNodes.length}, 面積=${signedArea.toStringAsFixed(4)}km²');
+        if (signedArea <= 0) {
+          print('  → 破棄: 負面積（外部面またはCW方向）');
+          continue;
+        }
+        if (signedArea < _minPolygonAreaSqKm) {
+          print('  → 破棄: 面積が小さすぎる（閾値: $_minPolygonAreaSqKm km²）');
+          continue;
+        }
+        print('  → ✓ 囲みポリゴンとして認定');
 
         enclosedPolygons.add(faceNodes);
       }

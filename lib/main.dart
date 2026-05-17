@@ -302,9 +302,9 @@ class _SanpoHomeState extends State<SanpoHome> {
         Polygon(
           polygonId: PolygonId('area-$i'),
           points: _displayEnclosedPolygons[i],
-          strokeColor: Colors.teal.withAlpha(110),
+          strokeColor: Colors.redAccent.withAlpha(110),
           strokeWidth: 1,
-          fillColor: Colors.teal.withAlpha(45),
+          fillColor: Colors.redAccent.withAlpha(45),
         ),
       );
     }
@@ -902,6 +902,22 @@ class _RoutesHistoryPageState extends State<RoutesHistoryPage> {
   Widget build(BuildContext context) {
     return Column(
       children: [
+        // リロードボタン
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.end,
+            children: [
+              FilledButton.icon(
+                onPressed: () {
+                  widget.onRouteDeleted();
+                },
+                icon: const Icon(Icons.refresh),
+                label: const Text('リロード'),
+              ),
+            ],
+          ),
+        ),
         if (widget.conqueredMunicipalityName != null)
           Container(
             width: double.infinity,
