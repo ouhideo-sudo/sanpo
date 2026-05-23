@@ -2,10 +2,12 @@ import 'dart:convert';
 import 'dart:math';
 import 'package:google_maps_flutter/google_maps_flutter.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import '../models/active_route_draft.dart';
 import '../models/walk_route.dart';
 
 class RouteService {
   static const _routesKey = 'routes_list';
+  static const _activeDraftKey = 'active_route_draft';
   final SharedPreferences prefs;
 
   RouteService(this.prefs);
@@ -43,6 +45,24 @@ class RouteService {
 
   Future<void> deleteAllRoutes() async {
     await prefs.remove(_routesKey);
+  }
+
+  Future<void> saveActiveDraft(ActiveRouteDraft draft) async {
+    await prefs.setString(_activeDraftKey, jsonEncode(draft.toJson()));
+  }
+
+  ActiveRouteDraft? getActiveDraft() {
+    final json = prefs.getString(_activeDraftKey);
+    if (json == null) {
+      return null;
+    }
+
+    final decoded = jsonDecode(json) as Map<String, dynamic>;
+    return ActiveRouteDraft.fromJson(decoded);
+  }
+
+  Future<void> clearActiveDraft() async {
+    await prefs.remove(_activeDraftKey);
   }
 
   /// 2つの地点間の距離をキロメートルで計算（Haversine公式）

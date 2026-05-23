@@ -1,8 +1,12 @@
+import 'dart:async';
+
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'models/active_route_draft.dart';
 import 'models/walk_route.dart';
 import 'services/area_coverage_service.dart';
 import 'services/route_service.dart';
@@ -42,9 +46,10 @@ class SanpoHome extends StatefulWidget {
   State<SanpoHome> createState() => _SanpoHomeState();
 }
 
-class _SanpoHomeState extends State<SanpoHome> {
+class _SanpoHomeState extends State<SanpoHome> with WidgetsBindingObserver {
   static const double _destinationArrivalThresholdMeters = 35;
   static const double _municipalityConqueredThreshold = 0.9;
+  static const Duration _draftSaveInterval = Duration(seconds: 10);
 
   late GoogleMapController mapController;
   late RouteService routeService;
@@ -74,14 +79,32 @@ class _SanpoHomeState extends State<SanpoHome> {
   final List<LatLng> _currentRoute = [];
   bool _isRecording = false;
   DateTime? _recordingStartTime;
+  StreamSubscription<Position>? _positionSubscription;
+  DateTime? _lastDraftSavedAt;
   
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     routeService = RouteService(widget.prefs);
     areaCoverageService = AreaCoverageService();
     _requestLocationPermission();
     _loadSavedRoutes();
+    _restoreActiveDraft();
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _positionSubscription?.cancel();
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.paused || state == AppLifecycleState.inactive) {
+      _persistActiveDraft(force: true);
+    }
   }
 
   Future<void> _loadSavedRoutes() async {
@@ -153,13 +176,223 @@ class _SanpoHomeState extends State<SanpoHome> {
   }
 
   Future<void> _requestLocationPermission() async {
+    final servicesEnabled = await Geolocator.isLocationServiceEnabled();
+    if (!servicesEnabled && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('位置情報サービスを有効にしてください')),
+      );
+    }
+
     final status = await Geolocator.requestPermission();
-    if (status == LocationPermission.denied) {
+    if (status == LocationPermission.denied || status == LocationPermission.deniedForever) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text('位置情報許可が必要です')),
         );
       }
+    }
+  }
+
+  Future<void> _restoreActiveDraft() async {
+    final draft = routeService.getActiveDraft();
+    if (draft == null || draft.points.isEmpty) {
+      return;
+    }
+
+    setState(() {
+      _isRecording = true;
+      _recordingStartTime = draft.startTime;
+      _currentRoute
+        ..clear()
+        ..addAll(draft.points);
+      _targetDistanceKm = draft.targetDistanceKm;
+      _suggestedDestination = draft.suggestedDestination;
+      _destinationMarker = draft.suggestedDestination == null
+          ? null
+          : Marker(
+              markerId: const MarkerId('suggested-destination'),
+              position: draft.suggestedDestination!,
+              infoWindow: const InfoWindow(title: '目的地'),
+            );
+    });
+
+    final trackingStarted = await _startPositionTracking();
+    if (!trackingStarted) {
+      if (mounted) {
+        setState(() {
+          _isRecording = false;
+          _targetDistanceKm = null;
+          _currentRoute.clear();
+          _recordingStartTime = null;
+          _suggestedDestination = null;
+          _destinationMarker = null;
+        });
+      }
+      // ドラフトは保持しておく（権限付与後に再起動すれば復元可能）
+      return;
+    }
+
+    if (mounted) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) {
+          return;
+        }
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('保存されていた散歩記録を復元しました'),
+            duration: Duration(seconds: 3),
+          ),
+        );
+      });
+    }
+  }
+
+  Future<void> _persistActiveDraft({bool force = false}) async {
+    if (!_isRecording || _recordingStartTime == null) {
+      return;
+    }
+    if (_currentRoute.isEmpty && !force) {
+      return;
+    }
+
+    final now = DateTime.now();
+    if (!force &&
+        _lastDraftSavedAt != null &&
+        now.difference(_lastDraftSavedAt!) < _draftSaveInterval) {
+      return;
+    }
+
+    _lastDraftSavedAt = now;
+    await routeService.saveActiveDraft(
+      ActiveRouteDraft(
+        startTime: _recordingStartTime!,
+        points: List<LatLng>.from(_currentRoute),
+        isSuggested: _targetDistanceKm != null,
+        targetDistanceKm: _targetDistanceKm,
+        suggestedDestination: _suggestedDestination,
+      ),
+    );
+  }
+
+  LocationSettings _buildLocationSettings() {
+    if (defaultTargetPlatform == TargetPlatform.android) {
+      return AndroidSettings(
+        accuracy: LocationAccuracy.high,
+        distanceFilter: 5,
+        intervalDuration: const Duration(seconds: 5),
+        foregroundNotificationConfig: const ForegroundNotificationConfig(
+          notificationTitle: 'Sanpo が散歩を記録中',
+          notificationText: 'バックグラウンドでも位置情報を記録しています。',
+          enableWakeLock: true,
+        ),
+      );
+    }
+
+    return const LocationSettings(
+      accuracy: LocationAccuracy.high,
+      distanceFilter: 5,
+    );
+  }
+
+  Future<bool> _startPositionTracking() async {
+    final permission = await Geolocator.checkPermission();
+    if (permission == LocationPermission.denied ||
+        permission == LocationPermission.deniedForever) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: const Text('位置情報の許可が必要です'),
+            action: permission == LocationPermission.deniedForever
+                ? SnackBarAction(
+                    label: '設定を開く',
+                    onPressed: () => Geolocator.openAppSettings(),
+                  )
+                : null,
+          ),
+        );
+      }
+      return false;
+    }
+
+    final servicesEnabled = await Geolocator.isLocationServiceEnabled();
+    if (!servicesEnabled) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('位置情報サービスを有効にしてください')),
+        );
+      }
+      return false;
+    }
+
+    await _positionSubscription?.cancel();
+    _positionSubscription = Geolocator.getPositionStream(
+      locationSettings: _buildLocationSettings(),
+    ).listen(
+      _handlePositionUpdate,
+      onError: (Object error) {
+        _positionSubscription?.cancel();
+        _positionSubscription = null;
+        if (mounted) {
+          setState(() {
+            _isRecording = false;
+            _targetDistanceKm = null;
+            _isDestinationSelectionMode = false;
+          });
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('位置追跡が中断されました。再度開始してください。'),
+            ),
+          );
+        }
+        routeService.clearActiveDraft();
+      },
+      cancelOnError: true,
+    );
+    return true;
+  }
+
+  Future<void> _handlePositionUpdate(Position position) async {
+    if (!_isRecording) {
+      return;
+    }
+
+    final latLng = LatLng(position.latitude, position.longitude);
+    final isDuplicatePoint = _currentRoute.isNotEmpty &&
+        Geolocator.distanceBetween(
+              _currentRoute.last.latitude,
+              _currentRoute.last.longitude,
+              latLng.latitude,
+              latLng.longitude,
+            ) <
+            3;
+    if (isDuplicatePoint) {
+      return;
+    }
+
+    if (mounted) {
+      setState(() {
+        _currentRoute.add(latLng);
+      });
+    } else {
+      _currentRoute.add(latLng);
+    }
+
+    await _persistActiveDraft();
+
+    final reachedDestination = _targetDistanceKm != null &&
+        _suggestedDestination != null &&
+        _isNearDestination(latLng);
+
+    if (reachedDestination) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('目的地に到着しました。記録を自動保存します。'),
+            duration: Duration(seconds: 2),
+          ),
+        );
+      }
+      await _stopRouteRecording(isSuggestedCompleted: true);
     }
   }
 
@@ -183,14 +416,23 @@ class _SanpoHomeState extends State<SanpoHome> {
     }
   }
 
-  void _startRouteRecording({double? targetDistanceKm}) {
+  Future<void> _startRouteRecording({double? targetDistanceKm}) async {
     setState(() {
       _isRecording = true;
       _targetDistanceKm = targetDistanceKm;
       _currentRoute.clear();
       _recordingStartTime = DateTime.now();
     });
-    _trackPosition();
+    _lastDraftSavedAt = null;
+    await _persistActiveDraft(force: true);
+    final success = await _startPositionTracking();
+    if (!success && mounted) {
+      setState(() {
+        _isRecording = false;
+        _targetDistanceKm = null;
+      });
+      await routeService.clearActiveDraft();
+    }
   }
 
   void _startRegularWalk() {
@@ -226,6 +468,9 @@ class _SanpoHomeState extends State<SanpoHome> {
   Future<void> _stopRouteRecording({bool isSuggestedCompleted = false}) async {
     final wasSuggestedRoute = _targetDistanceKm != null;
 
+    await _positionSubscription?.cancel();
+    _positionSubscription = null;
+
     setState(() {
       _isRecording = false;
       _targetDistanceKm = null;
@@ -249,6 +494,7 @@ class _SanpoHomeState extends State<SanpoHome> {
       );
 
       await routeService.saveRoute(route);
+      await routeService.clearActiveDraft();
 
       await _loadSavedRoutes();
 
@@ -266,6 +512,8 @@ class _SanpoHomeState extends State<SanpoHome> {
           ),
         );
       }
+    } else {
+      await routeService.clearActiveDraft();
     }
   }
 
@@ -329,37 +577,6 @@ class _SanpoHomeState extends State<SanpoHome> {
     setState(() {
       _showEnclosedAreas = value;
     });
-  }
-
-  Future<void> _trackPosition() async {
-    if (!_isRecording) return;
-
-    final position = await Geolocator.getCurrentPosition();
-    final latLng = LatLng(position.latitude, position.longitude);
-    if (mounted) {
-      setState(() {
-        _currentRoute.add(latLng);
-      });
-
-      final reachedDestination = _targetDistanceKm != null &&
-          _suggestedDestination != null &&
-          _isNearDestination(latLng);
-
-      if (reachedDestination) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('目的地に到着しました。記録を自動保存します。'),
-            duration: Duration(seconds: 2),
-          ),
-        );
-        await _stopRouteRecording(isSuggestedCompleted: true);
-        return;
-      }
-    }
-
-    // 次の更新を1秒後に予約
-    await Future.delayed(const Duration(seconds: 1));
-    _trackPosition();
   }
 
   Future<void> _suggestRoute() async {
