@@ -19,8 +19,10 @@ class MunicipalityCoverageResult {
 }
 
 class AreaCoverageService {
-  static const double _snapThresholdMeters = 30.0;
-  static const double _minPolygonAreaSqKm = 0.003;
+  static const double _snapThresholdMeters = 20.0;
+  static const double _gapCloseMeters = 18.0;
+  static const double _minPolygonAreaSqKm = 0.0008;
+  static const double _maxPolygonAreaSqKm = 2.0;
 
   List<List<LatLng>> extractEnclosedPolygons(List<WalkRoute> routes) {
     final segmentRoutes = routes.where((route) => route.points.length >= 2).toList();
@@ -28,9 +30,12 @@ class AreaCoverageService {
       return [];
     }
 
-    final ref = segmentRoutes.first.points.first;
+    final allSegmentPoints = segmentRoutes.expand((route) => route.points);
+    final avgLatitude =
+        allSegmentPoints.map((point) => point.latitude).reduce((a, b) => a + b) /
+        segmentRoutes.fold<int>(0, (sum, route) => sum + route.points.length);
     final latStep = _snapThresholdMeters / 111320.0;
-    final lngScale = cos(ref.latitude * pi / 180).abs().clamp(0.2, 1.0);
+    final lngScale = cos(avgLatitude * pi / 180).abs().clamp(0.2, 1.0);
     final lngStep = _snapThresholdMeters / (111320.0 * lngScale);
 
     // 全ルートの生セグメントを収集する
@@ -69,9 +74,12 @@ class AreaCoverageService {
       nodeStore.entries.map((e) => MapEntry(e.key, e.value.center)),
     );
 
+    _bridgeNearbyDanglingNodes(nodes, adjacency);
+
     // 各ノードの隣接ノードを方位角で CCW 順にソートする（プラナー面検出に必要）
     final sortedAdj = <String, List<String>>{};
-    for (final u in adjacency.keys) {
+    final orderedNodeKeys = adjacency.keys.toList()..sort();
+    for (final u in orderedNodeKeys) {
       final uPos = nodes[u]!;
       final neighbors = adjacency[u]!.toList();
       neighbors.sort((a, b) {
@@ -89,9 +97,9 @@ class AreaCoverageService {
     // 内部面（有界面）は CCW 向きで符号付き面積が正になる。
     final halfEdgeVisited = <String>{};
     final enclosedPolygons = <List<LatLng>>[];
-    final safetyLimit = sortedAdj.length * 4;
+    final safetyLimit = sortedAdj.length * 8;
 
-    for (final u in sortedAdj.keys) {
+    for (final u in orderedNodeKeys) {
       for (final v in sortedAdj[u]!) {
         final startKey = '$u\x00$v';
         if (halfEdgeVisited.contains(startKey)) continue;
@@ -118,10 +126,10 @@ class AreaCoverageService {
 
         if (faceNodes.length < 3) continue;
 
-        // 内部面のみ保持（CCW = 符号付き面積 > 0）。外部無限面は CW で負になる。
-        final signedArea = _signedPolygonAreaSqKm(faceNodes);
-        if (signedArea <= 0) continue;
-        if (signedArea < _minPolygonAreaSqKm) continue;
+        // 向き判定は揺らぐケースがあるため、絶対面積で有効面のみを採用する。
+        final area = _signedPolygonAreaSqKm(faceNodes).abs();
+        if (area < _minPolygonAreaSqKm) continue;
+        if (area > _maxPolygonAreaSqKm) continue;
 
         enclosedPolygons.add(faceNodes);
       }
@@ -346,6 +354,56 @@ class AreaCoverageService {
     final latBucket = (point.latitude / latStep).round();
     final lngBucket = (point.longitude / lngStep).round();
     return '$latBucket:$lngBucket';
+  }
+
+  /// 切れ目になりやすい次数1ノード同士を近接距離でブリッジし、
+  /// GPSゆらぎによる微小ギャップを閉じる。
+  static void _bridgeNearbyDanglingNodes(
+    Map<String, LatLng> nodes,
+    Map<String, Set<String>> adjacency,
+  ) {
+    final dangling = adjacency.entries
+        .where((e) => e.value.length == 1)
+        .map((e) => e.key)
+        .toList()
+      ..sort();
+
+    for (var i = 0; i < dangling.length; i++) {
+      final a = dangling[i];
+      if ((adjacency[a]?.length ?? 0) != 1) continue;
+
+      String? best;
+      var bestDistance = double.infinity;
+
+      for (var j = i + 1; j < dangling.length; j++) {
+        final b = dangling[j];
+        if ((adjacency[b]?.length ?? 0) != 1) continue;
+        if (adjacency[a]!.contains(b)) continue;
+
+        final distance = _distanceMeters(nodes[a]!, nodes[b]!);
+        if (distance <= _gapCloseMeters && distance < bestDistance) {
+          best = b;
+          bestDistance = distance;
+        }
+      }
+
+      if (best != null) {
+        adjacency[a]!.add(best);
+        adjacency[best]!.add(a);
+      }
+    }
+  }
+
+  static double _distanceMeters(LatLng a, LatLng b) {
+    const r = 6371000.0;
+    final dLat = (b.latitude - a.latitude) * pi / 180.0;
+    final dLng = (b.longitude - a.longitude) * pi / 180.0;
+    final lat1 = a.latitude * pi / 180.0;
+    final lat2 = b.latitude * pi / 180.0;
+
+    final h = sin(dLat / 2) * sin(dLat / 2) +
+        cos(lat1) * cos(lat2) * sin(dLng / 2) * sin(dLng / 2);
+    return 2 * r * asin(min(1.0, sqrt(h)));
   }
 
   /// セグメントリストを受け取り、互いに交差する箇所で分割した新リストを返す。

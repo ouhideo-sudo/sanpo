@@ -51,7 +51,8 @@ class _SanpoHomeState extends State<SanpoHome> with WidgetsBindingObserver {
   static const double _municipalityConqueredThreshold = 0.9;
   static const Duration _draftSaveInterval = Duration(seconds: 10);
 
-  late GoogleMapController mapController;
+  GoogleMapController? _mapController;
+  int _mapControllerGeneration = 0;
   late RouteService routeService;
   late AreaCoverageService areaCoverageService;
   int _currentIndex = 0;
@@ -97,6 +98,7 @@ class _SanpoHomeState extends State<SanpoHome> with WidgetsBindingObserver {
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _positionSubscription?.cancel();
+    _mapController?.dispose();
     super.dispose();
   }
 
@@ -396,23 +398,41 @@ class _SanpoHomeState extends State<SanpoHome> with WidgetsBindingObserver {
     }
   }
 
-  Future<void> _getCurrentLocation() async {
+  Future<void> _getCurrentLocation({required int mapGeneration}) async {
     try {
       final position = await Geolocator.getCurrentPosition();
-      if (mounted) {
-        mapController.animateCamera(
-          CameraUpdate.newLatLngZoom(
-            LatLng(position.latitude, position.longitude),
-            15,
-          ),
-        );
-      }
+      await _animateMapCameraSafely(
+        CameraUpdate.newLatLngZoom(
+          LatLng(position.latitude, position.longitude),
+          15,
+        ),
+        mapGeneration: mapGeneration,
+      );
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('位置情報取得エラー: $e')),
         );
       }
+    }
+  }
+
+  Future<void> _animateMapCameraSafely(
+    CameraUpdate cameraUpdate, {
+    required int mapGeneration,
+  }) async {
+    final controller = _mapController;
+    if (!mounted || _currentIndex != 0 || controller == null) {
+      return;
+    }
+    if (mapGeneration != _mapControllerGeneration) {
+      return;
+    }
+
+    try {
+      await controller.animateCamera(cameraUpdate);
+    } on StateError {
+      // タブ切替などでマップが破棄された直後は無視する。
     }
   }
 
@@ -580,6 +600,7 @@ class _SanpoHomeState extends State<SanpoHome> with WidgetsBindingObserver {
   }
 
   Future<void> _suggestRoute() async {
+    final mapGeneration = _mapControllerGeneration;
     setState(() {
       _isSuggesting = true;
     });
@@ -635,7 +656,10 @@ class _SanpoHomeState extends State<SanpoHome> with WidgetsBindingObserver {
         });
 
         final bounds = _computeBounds(suggestion.points);
-        mapController.animateCamera(CameraUpdate.newLatLngBounds(bounds, 64));
+        await _animateMapCameraSafely(
+          CameraUpdate.newLatLngBounds(bounds, 64),
+          mapGeneration: mapGeneration,
+        );
       }
     } catch (e) {
       final message = e is RouteSuggestionException
@@ -824,6 +848,10 @@ class _SanpoHomeState extends State<SanpoHome> with WidgetsBindingObserver {
         selectedIndex: _currentIndex,
         onDestinationSelected: (index) {
           setState(() {
+            if (index != 0) {
+              _mapControllerGeneration++;
+              _mapController = null;
+            }
             _currentIndex = index;
           });
           // マップタブに戻るときは保存ルートをリロード
@@ -880,8 +908,10 @@ class _SanpoHomeState extends State<SanpoHome> with WidgetsBindingObserver {
       children: [
         GoogleMap(
           onMapCreated: (controller) {
-            mapController = controller;
-            _getCurrentLocation();
+            _mapController = controller;
+            _mapControllerGeneration++;
+            final generation = _mapControllerGeneration;
+            _getCurrentLocation(mapGeneration: generation);
           },
           onTap: (point) {
             if (_isRecording && _targetDistanceKm != null && _isDestinationSelectionMode) {
