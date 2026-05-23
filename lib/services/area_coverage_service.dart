@@ -20,7 +20,7 @@ class MunicipalityCoverageResult {
 
 class AreaCoverageService {
   static const double _snapThresholdMeters = 30.0;
-  static const double _minPolygonAreaSqKm = 0.03;
+  static const double _minPolygonAreaSqKm = 0.003;
 
   List<List<LatLng>> extractEnclosedPolygons(List<WalkRoute> routes) {
     final segmentRoutes = routes.where((route) => route.points.length >= 2).toList();
@@ -33,25 +33,32 @@ class AreaCoverageService {
     final lngScale = cos(ref.latitude * pi / 180).abs().clamp(0.2, 1.0);
     final lngStep = _snapThresholdMeters / (111320.0 * lngScale);
 
+    // 全ルートの生セグメントを収集する
+    final rawSegments = <(LatLng, LatLng)>[];
+    for (final route in segmentRoutes) {
+      for (var i = 0; i < route.points.length - 1; i++) {
+        rawSegments.add((route.points[i], route.points[i + 1]));
+      }
+    }
+
+    // セグメント同士の交差点でエッジを分割し、真に平面なグラフを構築する
+    final splitSegments = _splitAtIntersections(rawSegments);
+
     final nodeStore = <String, _NodeAccumulator>{};
     final adjacency = <String, Set<String>>{};
 
-    for (final route in segmentRoutes) {
-      for (var i = 0; i < route.points.length - 1; i++) {
-        final a = route.points[i];
-        final b = route.points[i + 1];
-        final aKey = _snapKey(a, latStep, lngStep);
-        final bKey = _snapKey(b, latStep, lngStep);
-        if (aKey == bKey) {
-          continue;
-        }
-
-        nodeStore.putIfAbsent(aKey, () => _NodeAccumulator()).add(a);
-        nodeStore.putIfAbsent(bKey, () => _NodeAccumulator()).add(b);
-
-        adjacency.putIfAbsent(aKey, () => <String>{}).add(bKey);
-        adjacency.putIfAbsent(bKey, () => <String>{}).add(aKey);
+    for (final (a, b) in splitSegments) {
+      final aKey = _snapKey(a, latStep, lngStep);
+      final bKey = _snapKey(b, latStep, lngStep);
+      if (aKey == bKey) {
+        continue;
       }
+
+      nodeStore.putIfAbsent(aKey, () => _NodeAccumulator()).add(a);
+      nodeStore.putIfAbsent(bKey, () => _NodeAccumulator()).add(b);
+
+      adjacency.putIfAbsent(aKey, () => <String>{}).add(bKey);
+      adjacency.putIfAbsent(bKey, () => <String>{}).add(aKey);
     }
 
     if (adjacency.isEmpty) {
@@ -113,16 +120,8 @@ class AreaCoverageService {
 
         // 内部面のみ保持（CCW = 符号付き面積 > 0）。外部無限面は CW で負になる。
         final signedArea = _signedPolygonAreaSqKm(faceNodes);
-        print('[DEBUG] 面検出: ノード数=${faceNodes.length}, 面積=${signedArea.toStringAsFixed(4)}km²');
-        if (signedArea <= 0) {
-          print('  → 破棄: 負面積（外部面またはCW方向）');
-          continue;
-        }
-        if (signedArea < _minPolygonAreaSqKm) {
-          print('  → 破棄: 面積が小さすぎる（閾値: $_minPolygonAreaSqKm km²）');
-          continue;
-        }
-        print('  → ✓ 囲みポリゴンとして認定');
+        if (signedArea <= 0) continue;
+        if (signedArea < _minPolygonAreaSqKm) continue;
 
         enclosedPolygons.add(faceNodes);
       }
@@ -347,6 +346,90 @@ class AreaCoverageService {
     final latBucket = (point.latitude / latStep).round();
     final lngBucket = (point.longitude / lngStep).round();
     return '$latBucket:$lngBucket';
+  }
+
+  /// セグメントリストを受け取り、互いに交差する箇所で分割した新リストを返す。
+  /// これにより GPS 軌跡の交差点にノードが生まれ、半エッジ法で囲みが検出できる。
+  static List<(LatLng, LatLng)> _splitAtIntersections(
+    List<(LatLng, LatLng)> segs,
+  ) {
+    final n = segs.length;
+    if (n < 2) return segs;
+
+    // 各セグメントに交差するパラメータ t を収集する
+    final splitTs = List<List<double>>.generate(n, (_) => []);
+
+    for (var i = 0; i < n; i++) {
+      final (a1, a2) = segs[i];
+      final aMinLat = min(a1.latitude, a2.latitude);
+      final aMaxLat = max(a1.latitude, a2.latitude);
+      final aMinLng = min(a1.longitude, a2.longitude);
+      final aMaxLng = max(a1.longitude, a2.longitude);
+
+      for (var j = i + 1; j < n; j++) {
+        final (b1, b2) = segs[j];
+        // バウンディングボックスで高速却下
+        if (max(b1.latitude, b2.latitude) < aMinLat ||
+            min(b1.latitude, b2.latitude) > aMaxLat ||
+            max(b1.longitude, b2.longitude) < aMinLng ||
+            min(b1.longitude, b2.longitude) > aMaxLng) {
+          continue;
+        }
+
+        final inter = _intersectParams(a1, a2, b1, b2);
+        if (inter == null) continue;
+
+        const eps = 1e-6;
+        // 端点は既に共有ノードとして扱われるので内部交差のみ分割する
+        if (inter.$1 > eps && inter.$1 < 1 - eps) splitTs[i].add(inter.$1);
+        if (inter.$2 > eps && inter.$2 < 1 - eps) splitTs[j].add(inter.$2);
+      }
+    }
+
+    final result = <(LatLng, LatLng)>[];
+    for (var i = 0; i < n; i++) {
+      final (start, end) = segs[i];
+      final ts = splitTs[i];
+      if (ts.isEmpty) {
+        result.add((start, end));
+      } else {
+        ts.sort();
+        var prev = start;
+        for (final t in ts) {
+          final pt = LatLng(
+            start.latitude + t * (end.latitude - start.latitude),
+            start.longitude + t * (end.longitude - start.longitude),
+          );
+          result.add((prev, pt));
+          prev = pt;
+        }
+        result.add((prev, end));
+      }
+    }
+    return result;
+  }
+
+  /// 2セグメントの交差パラメータ (t, s) を返す。t はセグメント1上、s はセグメント2上の位置。
+  /// 交差しない（平行 or 範囲外）場合は null を返す。
+  static (double, double)? _intersectParams(
+    LatLng a1, LatLng a2,
+    LatLng b1, LatLng b2,
+  ) {
+    final dx1 = a2.longitude - a1.longitude;
+    final dy1 = a2.latitude - a1.latitude;
+    final dx2 = b2.longitude - b1.longitude;
+    final dy2 = b2.latitude - b1.latitude;
+
+    final denom = dx1 * dy2 - dy1 * dx2;
+    if (denom.abs() < 1e-14) return null; // 平行
+
+    final dx3 = b1.longitude - a1.longitude;
+    final dy3 = b1.latitude - a1.latitude;
+    final t = (dx3 * dy2 - dy3 * dx2) / denom;
+    final s = (dx3 * dy1 - dy3 * dx1) / denom;
+
+    if (t < -1e-6 || t > 1 + 1e-6 || s < -1e-6 || s > 1 + 1e-6) return null;
+    return (t, s);
   }
 }
 
