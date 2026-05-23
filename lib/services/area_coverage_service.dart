@@ -355,6 +355,7 @@ class AreaCoverageService {
   ) {
     final n = segs.length;
     if (n < 2) return segs;
+    const eps = 1e-6;
 
     // 各セグメントに交差するパラメータ t を収集する
     final splitTs = List<List<double>>.generate(n, (_) => []);
@@ -377,12 +378,21 @@ class AreaCoverageService {
         }
 
         final inter = _intersectParams(a1, a2, b1, b2);
-        if (inter == null) continue;
+        if (inter != null) {
+          // 端点は既に共有ノードとして扱われるので内部交差のみ分割する
+          if (inter.$1 > eps && inter.$1 < 1 - eps) splitTs[i].add(inter.$1);
+          if (inter.$2 > eps && inter.$2 < 1 - eps) splitTs[j].add(inter.$2);
+          continue;
+        }
 
-        const eps = 1e-6;
-        // 端点は既に共有ノードとして扱われるので内部交差のみ分割する
-        if (inter.$1 > eps && inter.$1 < 1 - eps) splitTs[i].add(inter.$1);
-        if (inter.$2 > eps && inter.$2 < 1 - eps) splitTs[j].add(inter.$2);
+        // 平行で同一直線上に重なる場合（往復・折り返し）も分割点を追加する
+        final overlap = _colinearOverlapParams(a1, a2, b1, b2);
+        if (overlap == null) continue;
+
+        if (overlap.$1 > eps && overlap.$1 < 1 - eps) splitTs[i].add(overlap.$1);
+        if (overlap.$2 > eps && overlap.$2 < 1 - eps) splitTs[i].add(overlap.$2);
+        if (overlap.$3 > eps && overlap.$3 < 1 - eps) splitTs[j].add(overlap.$3);
+        if (overlap.$4 > eps && overlap.$4 < 1 - eps) splitTs[j].add(overlap.$4);
       }
     }
 
@@ -394,8 +404,23 @@ class AreaCoverageService {
         result.add((start, end));
       } else {
         ts.sort();
-        var prev = start;
+        final normalizedTs = <double>[];
         for (final t in ts) {
+          if (t <= eps || t >= 1 - eps) {
+            continue;
+          }
+          if (normalizedTs.isEmpty || (t - normalizedTs.last).abs() > eps) {
+            normalizedTs.add(t);
+          }
+        }
+
+        if (normalizedTs.isEmpty) {
+          result.add((start, end));
+          continue;
+        }
+
+        var prev = start;
+        for (final t in normalizedTs) {
           final pt = LatLng(
             start.latitude + t * (end.latitude - start.latitude),
             start.longitude + t * (end.longitude - start.longitude),
@@ -430,6 +455,57 @@ class AreaCoverageService {
 
     if (t < -1e-6 || t > 1 + 1e-6 || s < -1e-6 || s > 1 + 1e-6) return null;
     return (t, s);
+  }
+
+  /// 同一直線上でセグメントが重なる場合の分割パラメータを返す。
+  /// 戻り値は (aStart, aEnd, bStart, bEnd)。
+  static (double, double, double, double)? _colinearOverlapParams(
+    LatLng a1,
+    LatLng a2,
+    LatLng b1,
+    LatLng b2,
+  ) {
+    const eps = 1e-9;
+    final adx = a2.longitude - a1.longitude;
+    final ady = a2.latitude - a1.latitude;
+    final aLenSq = adx * adx + ady * ady;
+    if (aLenSq < eps) return null;
+
+    final cross1 = (b1.longitude - a1.longitude) * ady - (b1.latitude - a1.latitude) * adx;
+    final cross2 = (b2.longitude - a1.longitude) * ady - (b2.latitude - a1.latitude) * adx;
+    if (cross1.abs() > 1e-7 || cross2.abs() > 1e-7) {
+      return null;
+    }
+
+    final tB1 = ((b1.longitude - a1.longitude) * adx + (b1.latitude - a1.latitude) * ady) / aLenSq;
+    final tB2 = ((b2.longitude - a1.longitude) * adx + (b2.latitude - a1.latitude) * ady) / aLenSq;
+
+    final overlapStart = max(0.0, min(tB1, tB2));
+    final overlapEnd = min(1.0, max(tB1, tB2));
+    if (overlapEnd - overlapStart <= 1e-6) {
+      return null;
+    }
+
+    final pStart = LatLng(
+      a1.latitude + (a2.latitude - a1.latitude) * overlapStart,
+      a1.longitude + (a2.longitude - a1.longitude) * overlapStart,
+    );
+    final pEnd = LatLng(
+      a1.latitude + (a2.latitude - a1.latitude) * overlapEnd,
+      a1.longitude + (a2.longitude - a1.longitude) * overlapEnd,
+    );
+
+    final bdx = b2.longitude - b1.longitude;
+    final bdy = b2.latitude - b1.latitude;
+    final bLenSq = bdx * bdx + bdy * bdy;
+    if (bLenSq < eps) return null;
+
+    final sStart = ((pStart.longitude - b1.longitude) * bdx + (pStart.latitude - b1.latitude) * bdy) / bLenSq;
+    final sEnd = ((pEnd.longitude - b1.longitude) * bdx + (pEnd.latitude - b1.latitude) * bdy) / bLenSq;
+
+    final bStart = min(sStart, sEnd);
+    final bEnd = max(sStart, sEnd);
+    return (overlapStart, overlapEnd, bStart, bEnd);
   }
 }
 
