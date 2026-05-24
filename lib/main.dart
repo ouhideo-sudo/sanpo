@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -7,6 +8,7 @@ import 'package:geolocator/geolocator.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'models/active_route_draft.dart';
+import 'models/dungeon_challenge_result.dart';
 import 'models/walk_route.dart';
 import 'services/area_coverage_service.dart';
 import 'services/route_service.dart';
@@ -37,6 +39,26 @@ class MyApp extends StatelessWidget {
   }
 }
 
+enum PlayMode {
+  recommendation,
+  territory,
+  dungeon,
+}
+
+class ModeDefinition {
+  const ModeDefinition({
+    required this.mode,
+    required this.label,
+    required this.description,
+    required this.icon,
+  });
+
+  final PlayMode mode;
+  final String label;
+  final String description;
+  final IconData icon;
+}
+
 class SanpoHome extends StatefulWidget {
   const SanpoHome({super.key, required this.prefs});
 
@@ -50,22 +72,44 @@ class _SanpoHomeState extends State<SanpoHome> with WidgetsBindingObserver {
   static const double _destinationArrivalThresholdMeters = 35;
   static const double _municipalityConqueredThreshold = 0.9;
   static const Duration _draftSaveInterval = Duration(seconds: 10);
+  static const Duration _dungeonTimeLimit = Duration(minutes: 30);
+  static const Duration _dungeonRadarDuration = Duration(minutes: 5);
+  static const double _dungeonSearchRadiusMeters = 600;
+  static const double _dungeonRevealDistanceMeters = 50;
+
+  static const List<ModeDefinition> _modeDefinitions = [
+    ModeDefinition(
+      mode: PlayMode.recommendation,
+      label: 'おすすめ散歩ルート',
+      description: '提案ルートで散歩を楽しむモード',
+      icon: Icons.route,
+    ),
+    ModeDefinition(
+      mode: PlayMode.territory,
+      label: '陣取り',
+      description: '囲みエリアと自治体踏破を楽しむモード',
+      icon: Icons.crop_square,
+    ),
+    ModeDefinition(
+      mode: PlayMode.dungeon,
+      label: 'ダンジョン',
+      description: '制限時間内にダンジョン到達を目指すモード',
+      icon: Icons.fort,
+    ),
+  ];
 
   GoogleMapController? _mapController;
   int _mapControllerGeneration = 0;
   late RouteService routeService;
   late AreaCoverageService areaCoverageService;
+  final Random _random = Random();
   int _currentIndex = 0;
+  PlayMode _selectedMode = PlayMode.recommendation;
   List<WalkRoute> _savedRoutes = [];
-  // 全ルートから生成した囲みポリゴン（自治体制覇判定用）
-  List<List<LatLng>> _enclosedPolygons = [];
   // フィルター適用後の表示用囲みポリゴン
   List<List<LatLng>> _displayEnclosedPolygons = [];
   // Nominatim 再呼び出し抑制用キャッシュ（-1 = 未取得）
   int _lastMunicipalityCheckRouteCount = -1;
-  bool _showSuggestedWalkRoutes = true;
-  bool _showRegularWalkRoutes = true;
-  bool _showEnclosedAreas = true;
   bool _showSuggestionPanel = true;
   String? _conqueredMunicipalityName;
   double _municipalityCoverageRatio = 0;
@@ -82,6 +126,25 @@ class _SanpoHomeState extends State<SanpoHome> with WidgetsBindingObserver {
   DateTime? _recordingStartTime;
   StreamSubscription<Position>? _positionSubscription;
   DateTime? _lastDraftSavedAt;
+  bool _isDungeonActive = false;
+  LatLng? _dungeonCenter;
+  LatLng? _dungeonTarget;
+  DateTime? _dungeonStartedAt;
+  DateTime? _dungeonEndsAt;
+  Timer? _dungeonTimer;
+  Duration _dungeonRemaining = _dungeonTimeLimit;
+  DateTime? _radarEndsAt;
+  Duration _radarRemaining = Duration.zero;
+  bool _isRadarActive = false;
+  bool _hasUsedRadar = false;
+  bool _showModePanel = true;
+  bool _showDungeonPanel = true;
+  bool _showDungeonResult = false;
+  String _dungeonResultMessage = '';
+  LatLng? _latestPosition;
+  Offset? _radarButtonOffset;
+  double? _radarArrowAngle;
+  bool _isRefreshingRadarControl = false;
   
   @override
   void initState() {
@@ -98,6 +161,7 @@ class _SanpoHomeState extends State<SanpoHome> with WidgetsBindingObserver {
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _positionSubscription?.cancel();
+    _dungeonTimer?.cancel();
     _mapController?.dispose();
     super.dispose();
   }
@@ -132,8 +196,7 @@ class _SanpoHomeState extends State<SanpoHome> with WidgetsBindingObserver {
 
     setState(() {
       _savedRoutes = routes;
-      _enclosedPolygons = enclosedPolygons;
-      _displayEnclosedPolygons = _computeDisplayPolygons(routes, enclosedPolygons);
+      _displayEnclosedPolygons = enclosedPolygons;
       if (routeCountChanged && enclosedPolygons.isNotEmpty) {
         _lastMunicipalityCheckRouteCount = routes.length;
         _municipalityCoverageRatio = coverage?.coverageRatio ?? _municipalityCoverageRatio;
@@ -158,23 +221,6 @@ class _SanpoHomeState extends State<SanpoHome> with WidgetsBindingObserver {
     final avgLat = allPoints.map((p) => p.latitude).reduce((a, b) => a + b) / allPoints.length;
     final avgLng = allPoints.map((p) => p.longitude).reduce((a, b) => a + b) / allPoints.length;
     return LatLng(avgLat, avgLng);
-  }
-
-  // 現在のフィルター設定に合わせた表示用囲みポリゴンを返す。
-  List<List<LatLng>> _computeDisplayPolygons(
-    List<WalkRoute> routes,
-    List<List<LatLng>> allEnclosedPolygons,
-  ) {
-    // 両フィルターが ON の場合はキャッシュ済みを使う（再計算不要）
-    if (_showSuggestedWalkRoutes && _showRegularWalkRoutes) {
-      return allEnclosedPolygons;
-    }
-    final filteredRoutes = routes.where((r) {
-      if (r.isSuggested && !_showSuggestedWalkRoutes) return false;
-      if (!r.isSuggested && !_showRegularWalkRoutes) return false;
-      return true;
-    }).toList();
-    return areaCoverageService.extractEnclosedPolygons(filteredRoutes);
   }
 
   Future<void> _requestLocationPermission() async {
@@ -332,6 +378,9 @@ class _SanpoHomeState extends State<SanpoHome> with WidgetsBindingObserver {
     ).listen(
       _handlePositionUpdate,
       onError: (Object error) {
+        if (_isDungeonActive) {
+          unawaited(_finishDungeon(success: false, message: 'ダンジョン討伐失敗'));
+        }
         _positionSubscription?.cancel();
         _positionSubscription = null;
         if (mounted) {
@@ -354,11 +403,14 @@ class _SanpoHomeState extends State<SanpoHome> with WidgetsBindingObserver {
   }
 
   Future<void> _handlePositionUpdate(Position position) async {
+    final latLng = LatLng(position.latitude, position.longitude);
+    _latestPosition = latLng;
+    unawaited(_refreshRadarButtonOffset());
+    await _updateDungeonByPosition(latLng);
     if (!_isRecording) {
       return;
     }
 
-    final latLng = LatLng(position.latitude, position.longitude);
     final isDuplicatePoint = _currentRoute.isNotEmpty &&
         Geolocator.distanceBetween(
               _currentRoute.last.latitude,
@@ -401,6 +453,8 @@ class _SanpoHomeState extends State<SanpoHome> with WidgetsBindingObserver {
   Future<void> _getCurrentLocation({required int mapGeneration}) async {
     try {
       final position = await Geolocator.getCurrentPosition();
+      _latestPosition = LatLng(position.latitude, position.longitude);
+      unawaited(_refreshRadarButtonOffset());
       await _animateMapCameraSafely(
         CameraUpdate.newLatLngZoom(
           LatLng(position.latitude, position.longitude),
@@ -434,6 +488,411 @@ class _SanpoHomeState extends State<SanpoHome> with WidgetsBindingObserver {
     } on StateError {
       // タブ切替などでマップが破棄された直後は無視する。
     }
+  }
+
+  void _switchMode(PlayMode mode) {
+    setState(() {
+      _selectedMode = mode;
+      if (mode != PlayMode.recommendation) {
+        _showSuggestionPanel = false;
+      }
+      if (mode == PlayMode.dungeon) {
+        _showDungeonPanel = true;
+      }
+    });
+    unawaited(_refreshRadarButtonOffset());
+  }
+
+  Future<void> _startDungeon() async {
+    if (_isDungeonActive) {
+      return;
+    }
+
+    final permission = await Geolocator.checkPermission();
+    if (permission == LocationPermission.denied ||
+        permission == LocationPermission.deniedForever) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('ダンジョン開始には位置情報許可が必要です。')),
+        );
+      }
+      return;
+    }
+
+    try {
+      final position = await Geolocator.getCurrentPosition();
+      final center = LatLng(position.latitude, position.longitude);
+      final target = await _pickDungeonTarget(center);
+      if (target == null) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('ダンジョン設置に失敗しました。再試行してください。')),
+          );
+        }
+        return;
+      }
+
+      final now = DateTime.now();
+      final mapGeneration = _mapControllerGeneration;
+      setState(() {
+        _isDungeonActive = true;
+        _dungeonCenter = center;
+        _dungeonTarget = target;
+        _dungeonStartedAt = now;
+        _dungeonEndsAt = now.add(_dungeonTimeLimit);
+        _dungeonRemaining = _dungeonTimeLimit;
+        _radarEndsAt = null;
+        _radarRemaining = Duration.zero;
+        _isRadarActive = false;
+        _hasUsedRadar = false;
+        _showDungeonPanel = true;
+        _showDungeonResult = false;
+        _dungeonResultMessage = '';
+        _latestPosition = center;
+      });
+
+      _dungeonTimer?.cancel();
+      _dungeonTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+        _tickDungeonTimer();
+      });
+
+      await _startPositionTracking();
+
+      await _animateMapCameraSafely(
+        CameraUpdate.newLatLngZoom(center, 16),
+        mapGeneration: mapGeneration,
+      );
+      await _refreshRadarButtonOffset();
+    } catch (_) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('ダンジョン開始に失敗しました。')),
+        );
+      }
+    }
+  }
+
+  Future<LatLng?> _pickDungeonTarget(LatLng center) async {
+    final mapsApiKey = await ApiKeys.getMapsApiKey();
+    if (mapsApiKey.isEmpty) {
+      return null;
+    }
+
+    final service = RouteSuggestionService(mapsApiKey: mapsApiKey);
+    try {
+      final suggestion = await service.suggestLoopRoute(
+        center: center,
+        distanceKm: 2.0,
+      );
+      final inRange = suggestion.points.where((point) {
+        final meters = Geolocator.distanceBetween(
+          center.latitude,
+          center.longitude,
+          point.latitude,
+          point.longitude,
+        );
+        return meters <= _dungeonSearchRadiusMeters && meters >= 100;
+      }).toList();
+
+      if (inRange.isEmpty) {
+        return null;
+      }
+
+      return inRange[_random.nextInt(inRange.length)];
+    } catch (_) {
+      return null;
+    }
+  }
+
+  void _tickDungeonTimer() {
+    if (!_isDungeonActive || _dungeonEndsAt == null) {
+      return;
+    }
+
+    final now = DateTime.now();
+    final remaining = _dungeonEndsAt!.difference(now);
+    if (remaining <= Duration.zero) {
+      _finishDungeon(success: false, message: 'ダンジョン討伐失敗');
+      return;
+    }
+
+    var isRadarActive = _isRadarActive;
+    var radarEndsAt = _radarEndsAt;
+    var radarRemaining = _radarRemaining;
+    if (isRadarActive && radarEndsAt != null) {
+      final nextRadarRemaining = radarEndsAt.difference(now);
+      if (nextRadarRemaining <= Duration.zero) {
+        isRadarActive = false;
+        radarEndsAt = null;
+        radarRemaining = Duration.zero;
+      } else {
+        radarRemaining = nextRadarRemaining;
+      }
+    }
+
+    if (mounted) {
+      setState(() {
+        _dungeonRemaining = remaining;
+        _isRadarActive = isRadarActive;
+        _radarEndsAt = radarEndsAt;
+        _radarRemaining = radarRemaining;
+      });
+    }
+  }
+
+  void _activateRadar() {
+    if (!_isDungeonActive || _dungeonEndsAt == null || _hasUsedRadar) {
+      return;
+    }
+
+    final now = DateTime.now();
+    final dungeonEnd = _dungeonEndsAt!;
+    final desiredEnd = now.add(_dungeonRadarDuration);
+    final radarEnd = desiredEnd.isBefore(dungeonEnd) ? desiredEnd : dungeonEnd;
+    final remaining = radarEnd.difference(now);
+    if (remaining <= Duration.zero) {
+      return;
+    }
+
+    setState(() {
+      _isRadarActive = true;
+      _radarEndsAt = radarEnd;
+      _radarRemaining = remaining;
+      _hasUsedRadar = true;
+    });
+  }
+
+  Future<void> _updateDungeonByPosition(LatLng currentPosition) async {
+    if (!_isDungeonActive || _dungeonTarget == null) {
+      return;
+    }
+
+    final meters = Geolocator.distanceBetween(
+      currentPosition.latitude,
+      currentPosition.longitude,
+      _dungeonTarget!.latitude,
+      _dungeonTarget!.longitude,
+    );
+
+    if (meters <= _dungeonRevealDistanceMeters) {
+      await _finishDungeon(success: true, message: 'ダンジョン討伐');
+    }
+  }
+
+  Future<void> _finishDungeon({
+    required bool success,
+    required String message,
+  }) async {
+    if (!_isDungeonActive || _dungeonStartedAt == null) {
+      return;
+    }
+
+    final now = DateTime.now();
+    final elapsed = now.difference(_dungeonStartedAt!).inSeconds;
+
+    _dungeonTimer?.cancel();
+    await routeService.saveDungeonResult(
+      DungeonChallengeResult(
+        id: now.microsecondsSinceEpoch.toString(),
+        startTime: _dungeonStartedAt!,
+        endTime: now,
+        success: success,
+        elapsedSeconds: elapsed,
+      ),
+    );
+
+    if (mounted) {
+      setState(() {
+        _isDungeonActive = false;
+        _dungeonCenter = null;
+        _dungeonTarget = null;
+        _dungeonStartedAt = null;
+        _dungeonEndsAt = null;
+        _dungeonRemaining = _dungeonTimeLimit;
+        _radarEndsAt = null;
+        _radarRemaining = Duration.zero;
+        _isRadarActive = false;
+        _hasUsedRadar = false;
+        _showDungeonResult = true;
+        _dungeonResultMessage = message;
+        _radarButtonOffset = null;
+        _radarArrowAngle = null;
+      });
+    }
+
+    await _stopPositionTrackingIfIdle();
+  }
+
+  Future<void> _cancelDungeon() async {
+    if (!_isDungeonActive) {
+      return;
+    }
+
+    _dungeonTimer?.cancel();
+    if (mounted) {
+      setState(() {
+        _isDungeonActive = false;
+        _dungeonCenter = null;
+        _dungeonTarget = null;
+        _dungeonStartedAt = null;
+        _dungeonEndsAt = null;
+        _dungeonRemaining = _dungeonTimeLimit;
+        _radarEndsAt = null;
+        _radarRemaining = Duration.zero;
+        _isRadarActive = false;
+        _hasUsedRadar = false;
+        _showDungeonResult = false;
+        _dungeonResultMessage = '';
+        _radarButtonOffset = null;
+        _radarArrowAngle = null;
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('ダンジョン挑戦をキャンセルしました。')),
+      );
+    }
+
+    await _stopPositionTrackingIfIdle();
+  }
+
+  String _formatRemaining(Duration remaining) {
+    final minutes = remaining.inMinutes;
+    final seconds = remaining.inSeconds % 60;
+    return '${minutes.toString().padLeft(2, '0')}:${seconds.toString().padLeft(2, '0')}';
+  }
+
+  LatLng _offsetLatLng(
+    LatLng origin,
+    double distanceMeters,
+    double bearingDegrees,
+  ) {
+    const earthRadiusMeters = 6378137.0;
+    final angularDistance = distanceMeters / earthRadiusMeters;
+    final bearingRadians = bearingDegrees * pi / 180;
+    final latitudeRadians = origin.latitude * pi / 180;
+    final longitudeRadians = origin.longitude * pi / 180;
+
+    final shiftedLatitude = asin(
+      sin(latitudeRadians) * cos(angularDistance) +
+          cos(latitudeRadians) * sin(angularDistance) * cos(bearingRadians),
+    );
+    final shiftedLongitude = longitudeRadians +
+        atan2(
+          sin(bearingRadians) * sin(angularDistance) * cos(latitudeRadians),
+          cos(angularDistance) - sin(latitudeRadians) * sin(shiftedLatitude),
+        );
+
+    return LatLng(
+      shiftedLatitude * 180 / pi,
+      shiftedLongitude * 180 / pi,
+    );
+  }
+
+  Future<void> _refreshRadarButtonOffset() async {
+    if (!mounted || _isRefreshingRadarControl) {
+      return;
+    }
+    _isRefreshingRadarControl = true;
+
+    final controller = _mapController;
+    final latestPosition = _latestPosition;
+    if (_selectedMode != PlayMode.dungeon ||
+        !_isDungeonActive ||
+        controller == null ||
+        latestPosition == null) {
+      if (_radarButtonOffset != null) {
+        setState(() {
+          _radarButtonOffset = null;
+          _radarArrowAngle = null;
+        });
+      }
+      _isRefreshingRadarControl = false;
+      return;
+    }
+
+    try {
+      final center = await controller.getScreenCoordinate(latestPosition);
+      final eastEdge = await controller.getScreenCoordinate(
+        _offsetLatLng(latestPosition, _dungeonRevealDistanceMeters, 90),
+      );
+      final ringDx = (eastEdge.x - center.x).toDouble();
+      final ringDy = (eastEdge.y - center.y).toDouble();
+      final ringRadius = sqrt(ringDx * ringDx + ringDy * ringDy);
+      final safeRingRadius = ringRadius < 1 ? 1.0 : ringRadius;
+
+      var directionDx = ringDx;
+      var directionDy = ringDy;
+      var arrowAngle = pi / 2;
+
+      if (_isRadarActive && _dungeonTarget != null) {
+        final target = await controller.getScreenCoordinate(_dungeonTarget!);
+        directionDx = (target.x - center.x).toDouble();
+        directionDy = (target.y - center.y).toDouble();
+      }
+
+      final directionLength = sqrt(directionDx * directionDx + directionDy * directionDy);
+      final safeDirectionLength = directionLength < 1 ? 1.0 : directionLength;
+      if (directionLength >= 1) {
+        arrowAngle = atan2(directionDy, directionDx) + (pi / 2);
+      }
+      final outwardMultiplier = (safeRingRadius + 46) / safeDirectionLength;
+      final offset = Offset(
+        center.x + directionDx * outwardMultiplier,
+        center.y + directionDy * outwardMultiplier,
+      );
+
+      if (!mounted) {
+        _isRefreshingRadarControl = false;
+        return;
+      }
+
+      setState(() {
+        _radarButtonOffset = offset;
+        _radarArrowAngle = arrowAngle;
+      });
+    } catch (_) {
+      // カメラ更新中の座標変換失敗は次回更新で再計算する。
+    } finally {
+      _isRefreshingRadarControl = false;
+    }
+  }
+
+  Widget _buildFloatingRadarControl(BoxConstraints constraints) {
+    if (_selectedMode != PlayMode.dungeon || !_isDungeonActive) {
+      return const SizedBox.shrink();
+    }
+
+    const left = 8.0;
+    const bottom = 36.0;
+    final isAvailable = !_hasUsedRadar && !_isRadarActive;
+    final label = _isRadarActive
+        ? _formatRemaining(_radarRemaining)
+        : _hasUsedRadar
+            ? 'レーダー使用済み'
+            : 'レーダー';
+
+    return Positioned(
+      left: left,
+      bottom: bottom,
+      child: FilledButton.icon(
+        onPressed: isAvailable ? _activateRadar : null,
+        icon: _isRadarActive && _radarArrowAngle != null
+            ? Transform.rotate(
+                angle: _radarArrowAngle!,
+                child: const Icon(Icons.navigation),
+              )
+            : const Icon(Icons.explore),
+        label: Text(label),
+        style: FilledButton.styleFrom(
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+          backgroundColor: _isRadarActive
+              ? Colors.deepOrange
+              : _hasUsedRadar
+                  ? Colors.grey
+                  : Colors.teal,
+          foregroundColor: Colors.white,
+        ),
+      ),
+    );
   }
 
   Future<void> _startRouteRecording({double? targetDistanceKm}) async {
@@ -488,9 +947,6 @@ class _SanpoHomeState extends State<SanpoHome> with WidgetsBindingObserver {
   Future<void> _stopRouteRecording({bool isSuggestedCompleted = false}) async {
     final wasSuggestedRoute = _targetDistanceKm != null;
 
-    await _positionSubscription?.cancel();
-    _positionSubscription = null;
-
     setState(() {
       _isRecording = false;
       _targetDistanceKm = null;
@@ -535,27 +991,26 @@ class _SanpoHomeState extends State<SanpoHome> with WidgetsBindingObserver {
     } else {
       await routeService.clearActiveDraft();
     }
+
+    await _stopPositionTrackingIfIdle();
+  }
+
+  Future<void> _stopPositionTrackingIfIdle() async {
+    if (_isRecording || _isDungeonActive) {
+      return;
+    }
+    await _positionSubscription?.cancel();
+    _positionSubscription = null;
   }
 
   Set<Polyline> _buildSavedRoutePolylines() {
     final polylines = <Polyline>{};
     for (final route in _savedRoutes) {
-      if (route.isSuggested && !_showSuggestedWalkRoutes) {
-        continue;
-      }
-      if (!route.isSuggested && !_showRegularWalkRoutes) {
-        continue;
-      }
-
-      final color = route.isSuggested
-          ? (route.isSuggestedCompleted ? Colors.teal : Colors.deepOrange)
-          : Colors.blue;
-
       polylines.add(
         Polyline(
           polylineId: PolylineId(route.id),
           points: route.points,
-          color: color,
+          color: Colors.blue,
           width: 3,
         ),
       );
@@ -577,26 +1032,6 @@ class _SanpoHomeState extends State<SanpoHome> with WidgetsBindingObserver {
       );
     }
     return polygons;
-  }
-
-  void _toggleSuggestedFilter(bool value) {
-    setState(() {
-      _showSuggestedWalkRoutes = value;
-      _displayEnclosedPolygons = _computeDisplayPolygons(_savedRoutes, _enclosedPolygons);
-    });
-  }
-
-  void _toggleRegularFilter(bool value) {
-    setState(() {
-      _showRegularWalkRoutes = value;
-      _displayEnclosedPolygons = _computeDisplayPolygons(_savedRoutes, _enclosedPolygons);
-    });
-  }
-
-  void _toggleEnclosedAreaFilter(bool value) {
-    setState(() {
-      _showEnclosedAreas = value;
-    });
   }
 
   Future<void> _suggestRoute() async {
@@ -679,6 +1114,18 @@ class _SanpoHomeState extends State<SanpoHome> with WidgetsBindingObserver {
     }
   }
 
+  void _clearSuggestionPreview() {
+    if (_isRecording) {
+      return;
+    }
+    setState(() {
+      _latestSuggestion = null;
+      _suggestedPolyline = null;
+      _suggestedDestination = null;
+      _destinationMarker = null;
+    });
+  }
+
   LatLngBounds _computeBounds(List<LatLng> points) {
     var minLat = points.first.latitude;
     var maxLat = points.first.latitude;
@@ -735,25 +1182,6 @@ class _SanpoHomeState extends State<SanpoHome> with WidgetsBindingObserver {
       currentPoint.longitude,
     );
     return meters <= _destinationArrivalThresholdMeters;
-  }
-
-  void _toggleDestinationSelectionMode() {
-    if (!_isRecording || _targetDistanceKm == null) {
-      return;
-    }
-
-    setState(() {
-      _isDestinationSelectionMode = !_isDestinationSelectionMode;
-    });
-
-    if (_isDestinationSelectionMode && mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('地図をタップして新しい目的地を設定してください。'),
-          duration: Duration(seconds: 2),
-        ),
-      );
-    }
   }
 
   Future<void> _updateDestination(LatLng destination) async {
@@ -832,8 +1260,6 @@ class _SanpoHomeState extends State<SanpoHome> with WidgetsBindingObserver {
       RoutesHistoryPage(
         prefs: widget.prefs,
         onRouteDeleted: _loadSavedRoutes,
-        conqueredMunicipalityName: _conqueredMunicipalityName,
-        municipalityCoverageRatio: _municipalityCoverageRatio,
       ),
       SettingsPage(prefs: widget.prefs),
     ];
@@ -882,9 +1308,9 @@ class _SanpoHomeState extends State<SanpoHome> with WidgetsBindingObserver {
 
   Widget _buildMapPage() {
     final isSuggestionSupportedPlatform =
-      ApiKeys.isRouteSuggestionSupportedPlatform;
+        ApiKeys.isRouteSuggestionSupportedPlatform;
     final canSuggest =
-      isSuggestionSupportedPlatform && !_isSuggesting && !_isRecording;
+        isSuggestionSupportedPlatform && !_isSuggesting && !_isRecording;
     final liveDistanceKm = _currentRoute.length > 1
         ? RouteService.calculateTotalDistance(_currentRoute)
         : 0.0;
@@ -892,19 +1318,83 @@ class _SanpoHomeState extends State<SanpoHome> with WidgetsBindingObserver {
         ? '${liveDistanceKm.toStringAsFixed(2)} / ${_targetDistanceKm!.toStringAsFixed(1)} km'
         : '${liveDistanceKm.toStringAsFixed(2)} km';
 
-    final displayedPolylines = _buildSavedRoutePolylines();
-    final displayedPolygons = _showEnclosedAreas
-      ? _buildSavedRoutePolygons()
-      : <Polygon>{};
+    final displayedPolylines = _selectedMode == PlayMode.territory
+      ? _buildSavedRoutePolylines()
+      : <Polyline>{};
+    final displayedPolygons = _selectedMode == PlayMode.territory
+        ? _buildSavedRoutePolygons()
+        : <Polygon>{};
+    final displayedCircles = <Circle>{};
+
+    if (_selectedMode == PlayMode.dungeon && _dungeonCenter != null) {
+      displayedCircles.add(
+        Circle(
+          circleId: const CircleId('dungeon-range'),
+          center: _dungeonCenter!,
+          radius: _dungeonSearchRadiusMeters,
+          strokeColor: Colors.deepPurple.withAlpha(180),
+          strokeWidth: 2,
+          fillColor: Colors.deepPurple.withAlpha(35),
+        ),
+      );
+    }
+
+    if (_selectedMode == PlayMode.dungeon && _isDungeonActive && _latestPosition != null) {
+      displayedCircles.add(
+        Circle(
+          circleId: const CircleId('dungeon-reveal-zone-mask'),
+          center: _latestPosition!,
+          radius: _dungeonRevealDistanceMeters,
+          strokeColor: Colors.white,
+          strokeWidth: 1,
+          fillColor: Colors.white.withAlpha(210),
+        ),
+      );
+      displayedCircles.add(
+        Circle(
+          circleId: const CircleId('dungeon-reveal-zone'),
+          center: _latestPosition!,
+          radius: _dungeonRevealDistanceMeters,
+          strokeColor: Colors.orange.withAlpha(220),
+          strokeWidth: 2,
+          fillColor: Colors.transparent,
+        ),
+      );
+    }
+
     final displayedMarkers = <Marker>{};
     if (_destinationMarker != null) {
       displayedMarkers.add(_destinationMarker!);
     }
+
+    final canRevealDungeon =
+        _dungeonTarget != null &&
+        _latestPosition != null &&
+        Geolocator.distanceBetween(
+              _latestPosition!.latitude,
+              _latestPosition!.longitude,
+              _dungeonTarget!.latitude,
+              _dungeonTarget!.longitude,
+            ) <=
+            _dungeonRevealDistanceMeters;
+
+    if (_selectedMode == PlayMode.dungeon && _isDungeonActive && canRevealDungeon) {
+      displayedMarkers.add(
+        Marker(
+          markerId: const MarkerId('dungeon-target'),
+          position: _dungeonTarget!,
+          infoWindow: const InfoWindow(title: 'ダンジョン'),
+          icon: BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueViolet),
+        ),
+      );
+    }
+
     if (_suggestedPolyline != null) {
       displayedPolylines.add(_suggestedPolyline!);
     }
 
-    return Stack(
+    return LayoutBuilder(
+      builder: (context, constraints) => Stack(
       children: [
         GoogleMap(
           onMapCreated: (controller) {
@@ -912,6 +1402,13 @@ class _SanpoHomeState extends State<SanpoHome> with WidgetsBindingObserver {
             _mapControllerGeneration++;
             final generation = _mapControllerGeneration;
             _getCurrentLocation(mapGeneration: generation);
+            unawaited(_refreshRadarButtonOffset());
+          },
+          onCameraMove: (_) {
+            unawaited(_refreshRadarButtonOffset());
+          },
+          onCameraIdle: () {
+            unawaited(_refreshRadarButtonOffset());
           },
           onTap: (point) {
             if (_isRecording && _targetDistanceKm != null && _isDestinationSelectionMode) {
@@ -924,196 +1421,392 @@ class _SanpoHomeState extends State<SanpoHome> with WidgetsBindingObserver {
           ),
           polylines: displayedPolylines,
           polygons: displayedPolygons,
+          circles: displayedCircles,
           markers: displayedMarkers,
           myLocationEnabled: true,
           myLocationButtonEnabled: true,
           zoomControlsEnabled: true,
         ),
-        if (_showSuggestionPanel)
-          Positioned(
-            top: 12,
-            left: 12,
-            right: 12,
-            child: Card(
-              elevation: 2,
-              child: Padding(
-                padding: const EdgeInsets.all(12),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(
+        Positioned(
+          top: 12,
+          left: 12,
+          right: 12,
+          child: Column(
+            children: [
+              if (_showModePanel)
+                Card(
+                  elevation: 2,
+                  child: Padding(
+                    padding: const EdgeInsets.all(10),
+                    child: Column(
                       children: [
-                        const Expanded(
-                          child: Text(
-                            'おすすめ散歩ルート',
-                            style: TextStyle(fontWeight: FontWeight.bold),
+                        Row(
+                          children: [
+                            const Expanded(
+                              child: Text(
+                                'モード切替',
+                                style: TextStyle(fontWeight: FontWeight.bold),
+                              ),
+                            ),
+                            IconButton(
+                              onPressed: () {
+                                setState(() {
+                                  _showModePanel = false;
+                                });
+                              },
+                              icon: const Icon(Icons.close),
+                              visualDensity: VisualDensity.compact,
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 6),
+                        Wrap(
+                          spacing: 8,
+                          runSpacing: 8,
+                          children: _modeDefinitions.map((def) {
+                            return ChoiceChip(
+                              selected: _selectedMode == def.mode,
+                              label: Text(def.label),
+                              avatar: Icon(def.icon, size: 18),
+                              onSelected: (_) => _switchMode(def.mode),
+                            );
+                          }).toList(),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              if (!_showModePanel)
+                Align(
+                  alignment: Alignment.centerLeft,
+                  child: FilledButton.icon(
+                    onPressed: () {
+                      setState(() {
+                        _showModePanel = true;
+                      });
+                    },
+                    icon: const Icon(Icons.swap_horiz),
+                    label: const Text('モードを表示'),
+                  ),
+                ),
+              const SizedBox(height: 8),
+              if (_selectedMode == PlayMode.recommendation)
+                _buildRecommendationPanel(
+                  canSuggest: canSuggest,
+                  isSuggestionSupportedPlatform: isSuggestionSupportedPlatform,
+                  progressText: progressText,
+                ),
+              if (_selectedMode == PlayMode.territory) _buildTerritoryPanel(),
+              if (_selectedMode == PlayMode.dungeon) _buildDungeonPanel(),
+            ],
+          ),
+        ),
+        if (_showDungeonResult)
+          Positioned.fill(
+            child: ColoredBox(
+              color: Colors.black45,
+              child: Center(
+                child: Card(
+                  color: Colors.white,
+                  child: Padding(
+                    padding: const EdgeInsets.all(20),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text(
+                          _dungeonResultMessage,
+                          style: const TextStyle(
+                            fontSize: 32,
+                            fontWeight: FontWeight.bold,
                           ),
                         ),
-                        IconButton(
+                        const SizedBox(height: 12),
+                        FilledButton(
                           onPressed: () {
                             setState(() {
-                              _showSuggestionPanel = false;
+                              _showDungeonResult = false;
                             });
                           },
-                          icon: const Icon(Icons.close),
-                          tooltip: 'パネルを閉じる',
-                          visualDensity: VisualDensity.compact,
+                          child: const Text('閉じる'),
                         ),
                       ],
                     ),
-                    const SizedBox(height: 8),
-                    Wrap(
-                      spacing: 8,
-                      children: [
-                        for (final distance in [1.0, 2.0, 3.0, 5.0])
-                          ChoiceChip(
-                            label: Text('${distance.toStringAsFixed(0)}km'),
-                            selected: _selectedSuggestionDistanceKm == distance,
-                            onSelected: (_) {
-                              setState(() {
-                                _selectedSuggestionDistanceKm = distance;
-                              });
-                            },
-                          ),
-                      ],
-                    ),
-                    const SizedBox(height: 8),
-                    Wrap(
-                      spacing: 8,
-                      runSpacing: 8,
-                      children: [
-                        FilterChip(
-                          label: const Text('提案散歩を表示'),
-                          selected: _showSuggestedWalkRoutes,
-                          onSelected: _toggleSuggestedFilter,
-                        ),
-                        FilterChip(
-                          label: const Text('通常散歩を表示'),
-                          selected: _showRegularWalkRoutes,
-                          onSelected: _toggleRegularFilter,
-                        ),
-                        FilterChip(
-                          label: const Text('囲みエリアを表示'),
-                          selected: _showEnclosedAreas,
-                          onSelected: _toggleEnclosedAreaFilter,
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 8),
-                    FilledButton.icon(
-                      onPressed: canSuggest ? _suggestRoute : null,
-                      icon: _isSuggesting
-                          ? const SizedBox(
-                              width: 16,
-                              height: 16,
-                              child: CircularProgressIndicator(strokeWidth: 2),
-                            )
-                          : const Icon(Icons.route),
-                      label: Text(
-                        _isSuggesting
-                            ? '提案中...'
-                            : isSuggestionSupportedPlatform
-                                ? 'この距離で提案'
-                                : 'Android端末で利用可',
-                      ),
-                    ),
-                    if (!isSuggestionSupportedPlatform)
-                      const Padding(
-                        padding: EdgeInsets.only(top: 8),
-                        child: Text(
-                          '道路ベースの提案はAndroidアプリで利用できます。',
-                          style: TextStyle(color: Colors.black54),
-                        ),
-                      ),
-                    if (_latestSuggestion != null)
-                      Padding(
-                        padding: const EdgeInsets.only(top: 8),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              '提案: ${_latestSuggestion!.distanceKm.toStringAsFixed(1)}km '
-                              '(目安 ${_latestSuggestion!.estimatedMinutes}分)',
-                            ),
-                            if (_suggestedDestination != null)
-                              const Padding(
-                                padding: EdgeInsets.only(top: 4),
-                                child: Text('目的地は自動設定されます。到達時に自動保存します。'),
-                              ),
-                            const SizedBox(height: 8),
-                            OutlinedButton.icon(
-                              onPressed: _isRecording ? null : _startSuggestedWalk,
-                              icon: const Icon(Icons.play_circle_outline),
-                              label: const Text('この提案で開始'),
-                            ),
-                          ],
-                        ),
-                      ),
-                    if (_isRecording)
-                      Padding(
-                        padding: const EdgeInsets.only(top: 8),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              '記録中: $progressText',
-                              style: const TextStyle(fontWeight: FontWeight.w600),
-                            ),
-                            if (_targetDistanceKm != null)
-                              Padding(
-                                padding: const EdgeInsets.only(top: 8),
-                                child: OutlinedButton.icon(
-                                  onPressed: _toggleDestinationSelectionMode,
-                                  icon: Icon(
-                                    _isDestinationSelectionMode
-                                        ? Icons.close
-                                        : Icons.edit_location_alt,
-                                  ),
-                                  label: Text(
-                                    _isDestinationSelectionMode
-                                        ? '目的地変更をキャンセル'
-                                        : '目的地を変更',
-                                  ),
-                                ),
-                              ),
-                          ],
-                        ),
-                      ),
-                  ],
+                  ),
                 ),
               ),
             ),
-          )
-        else
+          ),
+        _buildFloatingRadarControl(constraints),
+        if (_selectedMode != PlayMode.dungeon)
           Positioned(
-            top: 12,
-            left: 12,
-            child: FilledButton.icon(
-              onPressed: () {
-                setState(() {
-                  _showSuggestionPanel = true;
-                });
-              },
-              icon: const Icon(Icons.route),
-              label: const Text('おすすめを表示'),
+            bottom: 20,
+            left: 20,
+            right: 20,
+            child: Center(
+              child: FloatingActionButton.extended(
+                onPressed: _isRecording ? _stopRouteRecording : _startRegularWalk,
+                label: Text(_isRecording ? '停止' : '開始'),
+                icon: Icon(_isRecording ? Icons.stop : Icons.play_arrow),
+                backgroundColor: _isRecording ? Colors.red : Colors.green,
+              ),
             ),
           ),
-        Positioned(
-          bottom: 20,
-          left: 20,
-          right: 20,
-          child: Center(
-            child: FloatingActionButton.extended(
-              onPressed: _isRecording
-                  ? _stopRouteRecording
-                  : _startRegularWalk,
-              label: Text(_isRecording ? '停止' : '開始'),
-              icon: Icon(_isRecording ? Icons.stop : Icons.play_arrow),
-              backgroundColor: _isRecording ? Colors.red : Colors.green,
-            ),
-          ),
-        ),
       ],
+    ),
+    );
+  }
+
+  Widget _buildRecommendationPanel({
+    required bool canSuggest,
+    required bool isSuggestionSupportedPlatform,
+    required String progressText,
+  }) {
+    if (!_showSuggestionPanel) {
+      return Align(
+        alignment: Alignment.centerLeft,
+        child: FilledButton.icon(
+          onPressed: () {
+            setState(() {
+              _showSuggestionPanel = true;
+            });
+          },
+          icon: const Icon(Icons.route),
+          label: const Text('おすすめを表示'),
+        ),
+      );
+    }
+
+    return Card(
+      elevation: 2,
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Expanded(
+                  child: Text(
+                    'おすすめ散歩ルート',
+                    style: TextStyle(fontWeight: FontWeight.bold),
+                  ),
+                ),
+                IconButton(
+                  onPressed: () {
+                    setState(() {
+                      _showSuggestionPanel = false;
+                    });
+                  },
+                  icon: const Icon(Icons.close),
+                  visualDensity: VisualDensity.compact,
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 8,
+              children: [
+                for (final distance in [1.0, 2.0, 3.0, 5.0])
+                  ChoiceChip(
+                    label: Text('${distance.toStringAsFixed(0)}km'),
+                    selected: _selectedSuggestionDistanceKm == distance,
+                    onSelected: (_) {
+                      setState(() {
+                        _selectedSuggestionDistanceKm = distance;
+                      });
+                    },
+                  ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                Expanded(
+                  child: FilledButton.icon(
+                    onPressed: canSuggest ? _suggestRoute : null,
+                    icon: _isSuggesting
+                        ? const SizedBox(
+                            width: 16,
+                            height: 16,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.route),
+                    label: Text(
+                      _isSuggesting
+                          ? '提案中...'
+                          : isSuggestionSupportedPlatform
+                              ? 'この距離で提案'
+                              : 'Android端末で利用可',
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                IconButton.filledTonal(
+                  onPressed: (_suggestedPolyline != null && !_isRecording)
+                      ? _clearSuggestionPreview
+                      : null,
+                  tooltip: '提案表示を消す',
+                  icon: const Icon(Icons.close),
+                ),
+              ],
+            ),
+            if (_latestSuggestion != null)
+              Padding(
+                padding: const EdgeInsets.only(top: 8),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      '提案: ${_latestSuggestion!.distanceKm.toStringAsFixed(1)}km '
+                      '(目安 ${_latestSuggestion!.estimatedMinutes}分)',
+                    ),
+                    if (_suggestedDestination != null)
+                      const Padding(
+                        padding: EdgeInsets.only(top: 4),
+                        child: Text('目的地は自動設定されます。到達時に自動保存します。'),
+                      ),
+                    const SizedBox(height: 8),
+                    OutlinedButton.icon(
+                      onPressed: _isRecording ? null : _startSuggestedWalk,
+                      icon: const Icon(Icons.play_circle_outline),
+                      label: const Text('この提案で開始'),
+                    ),
+                  ],
+                ),
+              ),
+            if (_isRecording)
+              Padding(
+                padding: const EdgeInsets.only(top: 8),
+                child: Text(
+                  '記録中: $progressText',
+                  style: const TextStyle(fontWeight: FontWeight.w600),
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildTerritoryPanel() {
+    return Card(
+      elevation: 2,
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              '陣取りモード',
+              style: TextStyle(fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 6),
+            Text('囲み面数: ${_displayEnclosedPolygons.length}'),
+            const SizedBox(height: 6),
+            Text('自治体踏破率: ${(_municipalityCoverageRatio * 100).toStringAsFixed(0)}%'),
+            if (_conqueredMunicipalityName != null)
+              Padding(
+                padding: const EdgeInsets.only(top: 4),
+                child: Text('制覇: $_conqueredMunicipalityName'),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildDungeonPanel() {
+    if (!_showDungeonPanel) {
+      return Align(
+        alignment: Alignment.centerLeft,
+        child: FilledButton.icon(
+          onPressed: () {
+            setState(() {
+              _showDungeonPanel = true;
+            });
+          },
+          icon: const Icon(Icons.fort),
+          label: const Text('ダンジョンを表示'),
+        ),
+      );
+    }
+
+    return Card(
+      elevation: 2,
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Expanded(
+                  child: Text(
+                    'ダンジョンモード',
+                    style: TextStyle(fontWeight: FontWeight.bold),
+                  ),
+                ),
+                IconButton(
+                  onPressed: () {
+                    setState(() {
+                      _showDungeonPanel = false;
+                    });
+                  },
+                  icon: const Icon(Icons.close),
+                  visualDensity: VisualDensity.compact,
+                ),
+              ],
+            ),
+            const SizedBox(height: 6),
+            const Text('現在位置から半径600m内にダンジョンを発生します。'),
+            const SizedBox(height: 8),
+            if (_isDungeonActive)
+              Text(
+                '残り時間: ${_formatRemaining(_dungeonRemaining)}',
+                style: const TextStyle(
+                  fontWeight: FontWeight.w700,
+                  fontSize: 18,
+                ),
+              ),
+            if (_isDungeonActive) ...[
+              const SizedBox(height: 6),
+              Text(
+                _isRadarActive
+                    ? 'レーダー作動中: ${_formatRemaining(_radarRemaining)}'
+                    : _hasUsedRadar
+                        ? 'レーダー使用済みです。'
+                        : '現在地の周囲50mの枠内に入るとダンジョンが見えます。',
+                style: const TextStyle(color: Colors.black87),
+              ),
+            ],
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                Expanded(
+                  child: FilledButton.icon(
+                    onPressed: _isDungeonActive ? null : _startDungeon,
+                    icon: const Icon(Icons.fort),
+                    label: Text(_isDungeonActive ? '挑戦中...' : 'ダンジョン発生'),
+                  ),
+                ),
+                if (_isDungeonActive) ...[
+                  const SizedBox(width: 8),
+                  IconButton.filledTonal(
+                    onPressed: _cancelDungeon,
+                    tooltip: '挑戦をキャンセル',
+                    icon: const Icon(Icons.close),
+                  ),
+                ],
+              ],
+            ),
+            const SizedBox(height: 6),
+            const Text(
+              '紫の円が探索範囲、白地の内側とオレンジの円枠がダンジョンを視認できる50m範囲です。レーダーは円の外側に表示され、1回だけ使えます。',
+              style: TextStyle(color: Colors.black54),
+            ),
+          ],
+        ),
+      ),
     );
   }
 }
@@ -1123,14 +1816,10 @@ class RoutesHistoryPage extends StatefulWidget {
     super.key,
     required this.prefs,
     required this.onRouteDeleted,
-    required this.conqueredMunicipalityName,
-    required this.municipalityCoverageRatio,
   });
 
   final SharedPreferences prefs;
   final VoidCallback onRouteDeleted;
-  final String? conqueredMunicipalityName;
-  final double municipalityCoverageRatio;
 
   @override
   State<RoutesHistoryPage> createState() => _RoutesHistoryPageState();
@@ -1147,133 +1836,143 @@ class _RoutesHistoryPageState extends State<RoutesHistoryPage> {
 
   @override
   Widget build(BuildContext context) {
-    return Column(
-      children: [
-        // リロードボタン
-        Container(
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-          child: Row(
-            mainAxisAlignment: MainAxisAlignment.end,
-            children: [
-              FilledButton.icon(
-                onPressed: () {
-                  widget.onRouteDeleted();
-                },
-                icon: const Icon(Icons.refresh),
-                label: const Text('リロード'),
-              ),
-            ],
-          ),
-        ),
-        if (widget.conqueredMunicipalityName != null)
+    return DefaultTabController(
+      length: 2,
+      child: Column(
+        children: [
           Container(
-            width: double.infinity,
-            margin: const EdgeInsets.fromLTRB(12, 12, 12, 0),
-            padding: const EdgeInsets.all(12),
-            decoration: BoxDecoration(
-              color: Colors.amber.shade50,
-              borderRadius: BorderRadius.circular(12),
-              border: Border.all(color: Colors.amber.shade300),
-            ),
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
             child: Row(
               children: [
-                Icon(Icons.emoji_events, color: Colors.amber.shade800),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: Text(
-                    '${widget.conqueredMunicipalityName} 制覇',
-                    style: const TextStyle(fontWeight: FontWeight.bold),
+                const Expanded(
+                  child: TabBar(
+                    tabs: [
+                      Tab(text: '散歩履歴'),
+                      Tab(text: 'ダンジョン履歴'),
+                    ],
                   ),
                 ),
-                Text(
-                  '${(widget.municipalityCoverageRatio * 100).toStringAsFixed(0)}%',
-                  style: const TextStyle(fontWeight: FontWeight.w600),
+                const SizedBox(width: 8),
+                FilledButton.icon(
+                  onPressed: () {
+                    widget.onRouteDeleted();
+                    setState(() {});
+                  },
+                  icon: const Icon(Icons.refresh),
+                  label: const Text('リロード'),
                 ),
               ],
             ),
           ),
-        Expanded(
-          child: FutureBuilder<List<WalkRoute>>(
-            future: routeService.getRoutes(),
-            builder: (context, snapshot) {
-              if (snapshot.connectionState == ConnectionState.waiting) {
-                return const Center(child: CircularProgressIndicator());
-              }
+          Expanded(
+            child: TabBarView(
+              children: [
+                FutureBuilder<List<WalkRoute>>(
+                  future: routeService.getRoutes(),
+                  builder: (context, snapshot) {
+                    if (snapshot.connectionState == ConnectionState.waiting) {
+                      return const Center(child: CircularProgressIndicator());
+                    }
 
-              final routes = snapshot.data ?? [];
-              if (routes.isEmpty) {
-                return const Center(
-                  child: Text('記録されたルートがありません'),
-                );
-              }
+                    final routes = snapshot.data ?? [];
+                    if (routes.isEmpty) {
+                      return const Center(child: Text('記録されたルートがありません'));
+                    }
 
-              return ListView.builder(
-                itemCount: routes.length,
-                itemBuilder: (context, index) {
-                  final route = routes[index];
-                  return ListTile(
-                    leading: CircleAvatar(
-                      backgroundColor: route.isSuggested
-                          ? (route.isSuggestedCompleted ? Colors.teal : Colors.deepOrange)
-                          : Colors.blue,
-                      child: Text(
-                        '${route.distanceKm.toStringAsFixed(1)}km',
-                        style: const TextStyle(fontSize: 10, color: Colors.white),
-                      ),
-                    ),
-                    title: Row(
-                      children: [
-                        Expanded(
-                          child: Text(
+                    return ListView.builder(
+                      itemCount: routes.length,
+                      itemBuilder: (context, index) {
+                        final route = routes[index];
+                        return ListTile(
+                          leading: CircleAvatar(
+                            backgroundColor: Colors.blue,
+                            child: Text(
+                              '${route.distanceKm.toStringAsFixed(1)}km',
+                              style: const TextStyle(fontSize: 10, color: Colors.white),
+                            ),
+                          ),
+                          title: Text(
                             '${route.startTime.month}/${route.startTime.day} ${route.startTime.hour}:${route.startTime.minute.toString().padLeft(2, '0')}',
                           ),
-                        ),
-                        if (route.isSuggested)
-                          Chip(
-                            label: Text(route.isSuggestedCompleted ? '提案完了' : '提案ルート'),
-                            visualDensity: VisualDensity.compact,
+                          subtitle: Text(
+                            '${route.durationMinutes}分 | 平均速度: ${route.speedKmh.toStringAsFixed(1)}km/h',
                           ),
-                      ],
-                    ),
-                    subtitle: Text(
-                      '${route.durationMinutes}分 | 平均速度: ${route.speedKmh.toStringAsFixed(1)}km/h',
-                    ),
-                    trailing: IconButton(
-                      icon: const Icon(Icons.delete, color: Colors.red),
-                      onPressed: () async {
-                        final confirmed = await showDialog<bool>(
-                          context: context,
-                          builder: (BuildContext context) {
-                            return AlertDialog(
-                              title: const Text('ルートを削除'),
-                              content: const Text('本当に削除しますか？'),
-                              actions: [
-                                TextButton(
-                                  onPressed: () => Navigator.of(context).pop(false),
-                                  child: const Text('キャンセル'),
-                                ),
-                                TextButton(
-                                  onPressed: () => Navigator.of(context).pop(true),
-                                  child: const Text('削除'),
-                                ),
-                              ],
-                            );
-                          },
+                          trailing: IconButton(
+                            icon: const Icon(Icons.delete, color: Colors.red),
+                            onPressed: () async {
+                              final confirmed = await showDialog<bool>(
+                                context: context,
+                                builder: (BuildContext context) {
+                                  return AlertDialog(
+                                    title: const Text('ルートを削除'),
+                                    content: const Text('本当に削除しますか？'),
+                                    actions: [
+                                      TextButton(
+                                        onPressed: () => Navigator.of(context).pop(false),
+                                        child: const Text('キャンセル'),
+                                      ),
+                                      TextButton(
+                                        onPressed: () => Navigator.of(context).pop(true),
+                                        child: const Text('削除'),
+                                      ),
+                                    ],
+                                  );
+                                },
+                              );
+                              if (confirmed == true) {
+                                await routeService.deleteRoute(route.id);
+                                widget.onRouteDeleted();
+                                setState(() {});
+                              }
+                            },
+                          ),
                         );
-                        if (confirmed == true) {
-                          await routeService.deleteRoute(route.id);
-                          widget.onRouteDeleted();
-                          setState(() {});
-                        }
                       },
-                    ),
-                  );
-                },
-              );
-            },
+                    );
+                  },
+                ),
+                FutureBuilder<List<DungeonChallengeResult>>(
+                  future: routeService.getDungeonResults(),
+                  builder: (context, snapshot) {
+                    if (snapshot.connectionState == ConnectionState.waiting) {
+                      return const Center(child: CircularProgressIndicator());
+                    }
+
+                    final results = snapshot.data ?? [];
+                    if (results.isEmpty) {
+                      return const Center(child: Text('ダンジョン挑戦履歴がありません'));
+                    }
+
+                    return ListView.builder(
+                      itemCount: results.length,
+                      itemBuilder: (context, index) {
+                        final result = results[index];
+                        final status = result.success ? '成功' : '失敗';
+                        return ListTile(
+                          leading: CircleAvatar(
+                            backgroundColor:
+                                result.success ? Colors.teal : Colors.redAccent,
+                            child: Icon(
+                              result.success ? Icons.check : Icons.close,
+                              color: Colors.white,
+                            ),
+                          ),
+                          title: Text(
+                            '${result.startTime.month}/${result.startTime.day} ${result.startTime.hour}:${result.startTime.minute.toString().padLeft(2, '0')}',
+                          ),
+                          subtitle: Text(
+                            '$status | 経過: ${result.elapsedMinutes}分',
+                          ),
+                        );
+                      },
+                    );
+                  },
+                ),
+              ],
+            ),
           ),
-        ),
-      ],
+        ],
+      ),
     );
   }
 }
