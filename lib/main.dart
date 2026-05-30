@@ -73,9 +73,11 @@ class _SanpoHomeState extends State<SanpoHome> with WidgetsBindingObserver {
   static const double _municipalityConqueredThreshold = 0.9;
   static const Duration _draftSaveInterval = Duration(seconds: 10);
   static const Duration _dungeonTimeLimit = Duration(minutes: 30);
-  static const Duration _dungeonRadarDuration = Duration(minutes: 5);
+  static const Duration _dungeonRadarDuration = Duration(minutes: 10);
   static const double _dungeonSearchRadiusMeters = 600;
-  static const double _dungeonRevealDistanceMeters = 50;
+  static const double _dungeonRevealDistanceMeters = 100;
+  static const double _dungeonContactDistanceMeters = 20;
+  static const double _dungeonMinZoomLevel = 14.5;
 
   static const List<ModeDefinition> _modeDefinitions = [
     ModeDefinition(
@@ -133,10 +135,9 @@ class _SanpoHomeState extends State<SanpoHome> with WidgetsBindingObserver {
   DateTime? _dungeonEndsAt;
   Timer? _dungeonTimer;
   Duration _dungeonRemaining = _dungeonTimeLimit;
-  DateTime? _radarEndsAt;
-  Duration _radarRemaining = Duration.zero;
+  Duration _radarRemaining = _dungeonRadarDuration;
+  DateTime? _radarLastUpdatedAt;
   bool _isRadarActive = false;
-  bool _hasUsedRadar = false;
   bool _showModePanel = true;
   bool _showDungeonPanel = true;
   bool _showDungeonResult = false;
@@ -145,6 +146,8 @@ class _SanpoHomeState extends State<SanpoHome> with WidgetsBindingObserver {
   Offset? _radarButtonOffset;
   double? _radarArrowAngle;
   bool _isRefreshingRadarControl = false;
+  bool _isDungeonDefeatDialogOpen = false;
+  bool _hasDeclinedDefeatInRange = false;
   
   @override
   void initState() {
@@ -541,14 +544,15 @@ class _SanpoHomeState extends State<SanpoHome> with WidgetsBindingObserver {
         _dungeonStartedAt = now;
         _dungeonEndsAt = now.add(_dungeonTimeLimit);
         _dungeonRemaining = _dungeonTimeLimit;
-        _radarEndsAt = null;
-        _radarRemaining = Duration.zero;
+        _radarRemaining = _dungeonRadarDuration;
+        _radarLastUpdatedAt = null;
         _isRadarActive = false;
-        _hasUsedRadar = false;
         _showDungeonPanel = true;
         _showDungeonResult = false;
         _dungeonResultMessage = '';
         _latestPosition = center;
+        _isDungeonDefeatDialogOpen = false;
+        _hasDeclinedDefeatInRange = false;
       });
 
       _dungeonTimer?.cancel();
@@ -617,16 +621,25 @@ class _SanpoHomeState extends State<SanpoHome> with WidgetsBindingObserver {
     }
 
     var isRadarActive = _isRadarActive;
-    var radarEndsAt = _radarEndsAt;
     var radarRemaining = _radarRemaining;
-    if (isRadarActive && radarEndsAt != null) {
-      final nextRadarRemaining = radarEndsAt.difference(now);
-      if (nextRadarRemaining <= Duration.zero) {
-        isRadarActive = false;
-        radarEndsAt = null;
+    var radarLastUpdatedAt = _radarLastUpdatedAt;
+    if (isRadarActive) {
+      final last = radarLastUpdatedAt ?? now;
+      final elapsed = now.difference(last);
+      if (elapsed > Duration.zero) {
+        radarRemaining -= elapsed;
+      }
+      if (radarRemaining <= Duration.zero) {
         radarRemaining = Duration.zero;
+        isRadarActive = false;
+        radarLastUpdatedAt = null;
       } else {
-        radarRemaining = nextRadarRemaining;
+        radarLastUpdatedAt = now;
+      }
+    } else {
+      radarLastUpdatedAt = null;
+      if (radarRemaining < Duration.zero) {
+        radarRemaining = Duration.zero;
       }
     }
 
@@ -634,31 +647,35 @@ class _SanpoHomeState extends State<SanpoHome> with WidgetsBindingObserver {
       setState(() {
         _dungeonRemaining = remaining;
         _isRadarActive = isRadarActive;
-        _radarEndsAt = radarEndsAt;
         _radarRemaining = radarRemaining;
+        _radarLastUpdatedAt = radarLastUpdatedAt;
       });
     }
   }
 
   void _activateRadar() {
-    if (!_isDungeonActive || _dungeonEndsAt == null || _hasUsedRadar) {
+    if (!_isDungeonActive || _dungeonEndsAt == null || _radarRemaining <= Duration.zero) {
       return;
     }
 
-    final now = DateTime.now();
-    final dungeonEnd = _dungeonEndsAt!;
-    final desiredEnd = now.add(_dungeonRadarDuration);
-    final radarEnd = desiredEnd.isBefore(dungeonEnd) ? desiredEnd : dungeonEnd;
-    final remaining = radarEnd.difference(now);
-    if (remaining <= Duration.zero) {
+    if (_isRadarActive) {
       return;
     }
 
     setState(() {
       _isRadarActive = true;
-      _radarEndsAt = radarEnd;
-      _radarRemaining = remaining;
-      _hasUsedRadar = true;
+      _radarLastUpdatedAt = DateTime.now();
+    });
+  }
+
+  void _deactivateRadar() {
+    if (!_isRadarActive) {
+      return;
+    }
+
+    setState(() {
+      _isRadarActive = false;
+      _radarLastUpdatedAt = null;
     });
   }
 
@@ -674,8 +691,51 @@ class _SanpoHomeState extends State<SanpoHome> with WidgetsBindingObserver {
       _dungeonTarget!.longitude,
     );
 
-    if (meters <= _dungeonRevealDistanceMeters) {
+    if (meters > _dungeonRevealDistanceMeters) {
+      _hasDeclinedDefeatInRange = false;
+      return;
+    }
+
+    if (meters > _dungeonContactDistanceMeters) {
+      return;
+    }
+
+    if (_isDungeonDefeatDialogOpen || _hasDeclinedDefeatInRange || !mounted) {
+      return;
+    }
+
+    _isDungeonDefeatDialogOpen = true;
+    final shouldDefeat = await showDialog<bool>(
+          context: context,
+          barrierDismissible: false,
+          builder: (dialogContext) {
+            return AlertDialog(
+              title: const Text('ダンジョン'),
+              content: const Text('討伐しますか？'),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(dialogContext).pop(false),
+                  child: const Text('NO'),
+                ),
+                FilledButton(
+                  onPressed: () => Navigator.of(dialogContext).pop(true),
+                  child: const Text('YES'),
+                ),
+              ],
+            );
+          },
+        ) ??
+        false;
+    _isDungeonDefeatDialogOpen = false;
+
+    if (!_isDungeonActive) {
+      return;
+    }
+
+    if (shouldDefeat) {
       await _finishDungeon(success: true, message: 'ダンジョン討伐');
+    } else {
+      _hasDeclinedDefeatInRange = true;
     }
   }
 
@@ -709,14 +769,15 @@ class _SanpoHomeState extends State<SanpoHome> with WidgetsBindingObserver {
         _dungeonStartedAt = null;
         _dungeonEndsAt = null;
         _dungeonRemaining = _dungeonTimeLimit;
-        _radarEndsAt = null;
-        _radarRemaining = Duration.zero;
+        _radarRemaining = _dungeonRadarDuration;
+        _radarLastUpdatedAt = null;
         _isRadarActive = false;
-        _hasUsedRadar = false;
         _showDungeonResult = true;
         _dungeonResultMessage = message;
         _radarButtonOffset = null;
         _radarArrowAngle = null;
+        _isDungeonDefeatDialogOpen = false;
+        _hasDeclinedDefeatInRange = false;
       });
     }
 
@@ -737,14 +798,15 @@ class _SanpoHomeState extends State<SanpoHome> with WidgetsBindingObserver {
         _dungeonStartedAt = null;
         _dungeonEndsAt = null;
         _dungeonRemaining = _dungeonTimeLimit;
-        _radarEndsAt = null;
-        _radarRemaining = Duration.zero;
+        _radarRemaining = _dungeonRadarDuration;
+        _radarLastUpdatedAt = null;
         _isRadarActive = false;
-        _hasUsedRadar = false;
         _showDungeonResult = false;
         _dungeonResultMessage = '';
         _radarButtonOffset = null;
         _radarArrowAngle = null;
+        _isDungeonDefeatDialogOpen = false;
+        _hasDeclinedDefeatInRange = false;
       });
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('ダンジョン挑戦をキャンセルしました。')),
@@ -863,35 +925,125 @@ class _SanpoHomeState extends State<SanpoHome> with WidgetsBindingObserver {
 
     const left = 8.0;
     const bottom = 36.0;
-    final isAvailable = !_hasUsedRadar && !_isRadarActive;
+    final isAvailable = _radarRemaining > Duration.zero && !_isRadarActive;
+    final isExhausted = _radarRemaining <= Duration.zero;
     final label = _isRadarActive
         ? _formatRemaining(_radarRemaining)
-        : _hasUsedRadar
+        : isExhausted
             ? 'レーダー使用済み'
             : 'レーダー';
+    final radarBackgroundColor = _isRadarActive
+      ? Colors.white.withAlpha(238)
+      : isExhausted
+        ? Colors.grey
+        : Colors.indigo;
+    final radarForegroundColor = _isRadarActive ? Colors.indigo : Colors.white;
 
     return Positioned(
       left: left,
       bottom: bottom,
-      child: FilledButton.icon(
-        onPressed: isAvailable ? _activateRadar : null,
-        icon: _isRadarActive && _radarArrowAngle != null
-            ? Transform.rotate(
-                angle: _radarArrowAngle!,
-                child: const Icon(Icons.navigation),
-              )
-            : const Icon(Icons.explore),
-        label: Text(label),
-        style: FilledButton.styleFrom(
-          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-          backgroundColor: _isRadarActive
-              ? Colors.deepOrange
-              : _hasUsedRadar
-                  ? Colors.grey
-                  : Colors.teal,
-          foregroundColor: Colors.white,
-        ),
+      child: Row(
+        children: [
+          FilledButton.icon(
+            onPressed: isAvailable ? _activateRadar : null,
+            icon: _isRadarActive && _radarArrowAngle != null
+                ? Transform.rotate(
+                    angle: _radarArrowAngle!,
+                    child: const Icon(Icons.navigation, size: 22, color: Colors.indigo),
+                  )
+                : const Icon(Icons.explore, size: 22),
+            label: Text(
+              label,
+              style: TextStyle(color: radarForegroundColor),
+            ),
+            style: FilledButton.styleFrom(
+              padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
+              backgroundColor: radarBackgroundColor,
+              foregroundColor: radarForegroundColor,
+              disabledBackgroundColor: _isRadarActive
+                  ? Colors.white.withAlpha(238)
+                  : isExhausted
+                      ? Colors.grey
+                      : Colors.indigo,
+              disabledForegroundColor: _isRadarActive ? Colors.indigo : Colors.white,
+              textStyle: const TextStyle(fontSize: 17, fontWeight: FontWeight.w700),
+            ),
+          ),
+          if (_isRadarActive) ...[
+            const SizedBox(width: 6),
+            TextButton.icon(
+              onPressed: _deactivateRadar,
+              icon: const Icon(Icons.power_settings_new, size: 16),
+              label: const Text('OFF'),
+              style: TextButton.styleFrom(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                foregroundColor: Colors.black45,
+                textStyle: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
+                minimumSize: Size.zero,
+                tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+              ),
+            ),
+          ],
+        ],
       ),
+    );
+  }
+
+  String _radarStatusText() {
+    if (_isRadarActive) {
+      return 'レーダー作動中: ${_formatRemaining(_radarRemaining)}';
+    }
+    if (_radarRemaining <= Duration.zero) {
+      return 'レーダー使用済みです。';
+    }
+    return 'レーダー残り時間: ${_formatRemaining(_radarRemaining)}';
+  }
+
+  String _radarGuideText() {
+    if (_radarRemaining <= Duration.zero) {
+      return '紫の円が探索範囲、白地の内側とオレンジの円枠がダンジョンを視認できる100m範囲です。レーダーは10分を使い切ったため使用できません。';
+    }
+    return '紫の円が探索範囲、白地の内側とオレンジの円枠がダンジョンを視認できる100m範囲です。レーダーは合計10分まで使え、時間内なら何度でも再起動できます。';
+  }
+
+  Widget _buildRadarPanelRow() {
+    final canUseRadar = _radarRemaining > Duration.zero;
+    final isExhausted = _radarRemaining <= Duration.zero;
+    return Row(
+      children: [
+        Expanded(
+          child: FilledButton.icon(
+            onPressed: (canUseRadar && !_isRadarActive) ? _activateRadar : null,
+            icon: const Icon(Icons.explore, size: 21),
+            label: Text(isExhausted ? 'レーダー使用済み' : 'レーダー'),
+            style: FilledButton.styleFrom(
+              backgroundColor: isExhausted
+                  ? Colors.grey
+                  : Colors.indigo,
+              foregroundColor: Colors.white,
+              disabledBackgroundColor: isExhausted ? Colors.grey : Colors.indigo,
+              disabledForegroundColor: Colors.white,
+              padding: const EdgeInsets.symmetric(vertical: 14),
+              textStyle: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
+            ),
+          ),
+        ),
+        if (_isRadarActive) ...[
+          const SizedBox(width: 6),
+          TextButton.icon(
+            onPressed: _deactivateRadar,
+            icon: const Icon(Icons.power_settings_new, size: 16),
+            label: const Text('OFF'),
+            style: TextButton.styleFrom(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+              foregroundColor: Colors.black45,
+              textStyle: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
+              minimumSize: Size.zero,
+              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+            ),
+          ),
+        ],
+      ],
     );
   }
 
@@ -1423,6 +1575,10 @@ class _SanpoHomeState extends State<SanpoHome> with WidgetsBindingObserver {
           polygons: displayedPolygons,
           circles: displayedCircles,
           markers: displayedMarkers,
+          minMaxZoomPreference: MinMaxZoomPreference(
+            _isDungeonActive ? _dungeonMinZoomLevel : null,
+            null,
+          ),
           myLocationEnabled: true,
           myLocationButtonEnabled: true,
           zoomControlsEnabled: true,
@@ -1771,11 +1927,7 @@ class _SanpoHomeState extends State<SanpoHome> with WidgetsBindingObserver {
             if (_isDungeonActive) ...[
               const SizedBox(height: 6),
               Text(
-                _isRadarActive
-                    ? 'レーダー作動中: ${_formatRemaining(_radarRemaining)}'
-                    : _hasUsedRadar
-                        ? 'レーダー使用済みです。'
-                        : '現在地の周囲50mの枠内に入るとダンジョンが見えます。',
+                _radarStatusText(),
                 style: const TextStyle(color: Colors.black87),
               ),
             ],
@@ -1799,9 +1951,13 @@ class _SanpoHomeState extends State<SanpoHome> with WidgetsBindingObserver {
                 ],
               ],
             ),
+            if (_isDungeonActive) ...[
+              const SizedBox(height: 8),
+              _buildRadarPanelRow(),
+            ],
             const SizedBox(height: 6),
-            const Text(
-              '紫の円が探索範囲、白地の内側とオレンジの円枠がダンジョンを視認できる50m範囲です。レーダーは円の外側に表示され、1回だけ使えます。',
+            Text(
+              _radarGuideText(),
               style: TextStyle(color: Colors.black54),
             ),
           ],
