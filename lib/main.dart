@@ -74,10 +74,11 @@ class _SanpoHomeState extends State<SanpoHome> with WidgetsBindingObserver {
   static const Duration _draftSaveInterval = Duration(seconds: 10);
   static const Duration _dungeonTimeLimit = Duration(minutes: 30);
   static const Duration _dungeonRadarDuration = Duration(minutes: 10);
-  static const double _dungeonSearchRadiusMeters = 600;
+  static const double _dungeonSearchRadiusMeters = 500;
   static const double _dungeonRevealDistanceMeters = 100;
   static const double _dungeonContactDistanceMeters = 20;
   static const double _dungeonMinZoomLevel = 14.5;
+  static const IconData _dungeonIcon = Icons.castle;
 
   static const List<ModeDefinition> _modeDefinitions = [
     ModeDefinition(
@@ -96,7 +97,7 @@ class _SanpoHomeState extends State<SanpoHome> with WidgetsBindingObserver {
       mode: PlayMode.dungeon,
       label: 'ダンジョン',
       description: '制限時間内にダンジョン到達を目指すモード',
-      icon: Icons.fort,
+      icon: _dungeonIcon,
     ),
   ];
 
@@ -927,6 +928,7 @@ class _SanpoHomeState extends State<SanpoHome> with WidgetsBindingObserver {
     const bottom = 36.0;
     final isAvailable = _radarRemaining > Duration.zero && !_isRadarActive;
     final isExhausted = _radarRemaining <= Duration.zero;
+    final canToggle = _isRadarActive || isAvailable;
     final label = _isRadarActive
         ? _formatRemaining(_radarRemaining)
         : isExhausted
@@ -942,49 +944,43 @@ class _SanpoHomeState extends State<SanpoHome> with WidgetsBindingObserver {
     return Positioned(
       left: left,
       bottom: bottom,
-      child: Row(
-        children: [
-          FilledButton.icon(
-            onPressed: isAvailable ? _activateRadar : null,
-            icon: _isRadarActive && _radarArrowAngle != null
-                ? Transform.rotate(
-                    angle: _radarArrowAngle!,
-                    child: const Icon(Icons.navigation, size: 22, color: Colors.indigo),
-                  )
-                : const Icon(Icons.explore, size: 22),
-            label: Text(
-              label,
-              style: TextStyle(color: radarForegroundColor),
-            ),
-            style: FilledButton.styleFrom(
-              padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
-              backgroundColor: radarBackgroundColor,
-              foregroundColor: radarForegroundColor,
-              disabledBackgroundColor: _isRadarActive
-                  ? Colors.white.withAlpha(238)
-                  : isExhausted
-                      ? Colors.grey
-                      : Colors.indigo,
-              disabledForegroundColor: _isRadarActive ? Colors.indigo : Colors.white,
-              textStyle: const TextStyle(fontSize: 17, fontWeight: FontWeight.w700),
-            ),
+      child: FilledButton.icon(
+        onPressed: canToggle
+            ? () {
+                if (_isRadarActive) {
+                  _deactivateRadar();
+                } else {
+                  _activateRadar();
+                }
+              }
+            : null,
+        icon: _isRadarActive && _radarArrowAngle != null
+            ? Transform.rotate(
+                angle: _radarArrowAngle!,
+                child: const Icon(Icons.navigation, size: 22, color: Colors.indigo),
+              )
+            : const Icon(Icons.explore, size: 22),
+        label: Text(
+          label,
+          style: TextStyle(color: radarForegroundColor),
+        ),
+        style: FilledButton.styleFrom(
+          padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
+          backgroundColor: radarBackgroundColor,
+          foregroundColor: radarForegroundColor,
+          disabledBackgroundColor: _isRadarActive
+              ? Colors.white.withAlpha(238)
+              : isExhausted
+                  ? Colors.grey
+                  : Colors.indigo,
+          disabledForegroundColor: _isRadarActive ? Colors.indigo : Colors.white,
+          textStyle: const TextStyle(
+            inherit: false,
+            fontFamily: 'Roboto',
+            fontSize: 17,
+            fontWeight: FontWeight.w700,
           ),
-          if (_isRadarActive) ...[
-            const SizedBox(width: 6),
-            TextButton.icon(
-              onPressed: _deactivateRadar,
-              icon: const Icon(Icons.power_settings_new, size: 16),
-              label: const Text('OFF'),
-              style: TextButton.styleFrom(
-                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-                foregroundColor: Colors.black45,
-                textStyle: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
-                minimumSize: Size.zero,
-                tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-              ),
-            ),
-          ],
-        ],
+        ),
       ),
     );
   }
@@ -1009,40 +1005,50 @@ class _SanpoHomeState extends State<SanpoHome> with WidgetsBindingObserver {
   Widget _buildRadarPanelRow() {
     final canUseRadar = _radarRemaining > Duration.zero;
     final isExhausted = _radarRemaining <= Duration.zero;
+    final canToggle = _isRadarActive || canUseRadar;
     return Row(
       children: [
         Expanded(
           child: FilledButton.icon(
-            onPressed: (canUseRadar && !_isRadarActive) ? _activateRadar : null,
-            icon: const Icon(Icons.explore, size: 21),
-            label: Text(isExhausted ? 'レーダー使用済み' : 'レーダー'),
+            onPressed: canToggle
+                ? () {
+                    if (_isRadarActive) {
+                      _deactivateRadar();
+                    } else {
+                      _activateRadar();
+                    }
+                  }
+                : null,
+            icon: _isRadarActive && _radarArrowAngle != null
+                ? Transform.rotate(
+                    angle: _radarArrowAngle!,
+                    child: const Icon(Icons.navigation, size: 21, color: Colors.indigo),
+                  )
+                : const Icon(Icons.explore, size: 21),
+            label: Text(_isRadarActive ? _formatRemaining(_radarRemaining) : (isExhausted ? 'レーダー使用済み' : 'レーダー')),
             style: FilledButton.styleFrom(
-              backgroundColor: isExhausted
-                  ? Colors.grey
-                  : Colors.indigo,
-              foregroundColor: Colors.white,
-              disabledBackgroundColor: isExhausted ? Colors.grey : Colors.indigo,
-              disabledForegroundColor: Colors.white,
+              backgroundColor: _isRadarActive
+                  ? Colors.white.withAlpha(238)
+                  : isExhausted
+                      ? Colors.grey
+                      : Colors.indigo,
+              foregroundColor: _isRadarActive ? Colors.indigo : Colors.white,
+              disabledBackgroundColor: _isRadarActive
+                  ? Colors.white.withAlpha(238)
+                  : isExhausted
+                      ? Colors.grey
+                      : Colors.indigo,
+              disabledForegroundColor: _isRadarActive ? Colors.indigo : Colors.white,
               padding: const EdgeInsets.symmetric(vertical: 14),
-              textStyle: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
+              textStyle: const TextStyle(
+                inherit: false,
+                fontFamily: 'Roboto',
+                fontSize: 16,
+                fontWeight: FontWeight.w700,
+              ),
             ),
           ),
         ),
-        if (_isRadarActive) ...[
-          const SizedBox(width: 6),
-          TextButton.icon(
-            onPressed: _deactivateRadar,
-            icon: const Icon(Icons.power_settings_new, size: 16),
-            label: const Text('OFF'),
-            style: TextButton.styleFrom(
-              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-              foregroundColor: Colors.black45,
-              textStyle: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
-              minimumSize: Size.zero,
-              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-            ),
-          ),
-        ],
       ],
     );
   }
@@ -1875,14 +1881,45 @@ class _SanpoHomeState extends State<SanpoHome> with WidgetsBindingObserver {
     if (!_showDungeonPanel) {
       return Align(
         alignment: Alignment.centerLeft,
-        child: FilledButton.icon(
-          onPressed: () {
-            setState(() {
-              _showDungeonPanel = true;
-            });
-          },
-          icon: const Icon(Icons.fort),
-          label: const Text('ダンジョンを表示'),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            FilledButton.icon(
+              onPressed: () {
+                setState(() {
+                  _showDungeonPanel = true;
+                });
+              },
+              icon: const Icon(_dungeonIcon),
+              label: const Text('ダンジョンを表示'),
+            ),
+            if (_isDungeonActive) ...[
+              const SizedBox(height: 8),
+              DecoratedBox(
+                decoration: BoxDecoration(
+                  color: Colors.white.withAlpha(230),
+                  borderRadius: BorderRadius.circular(14),
+                  boxShadow: const [
+                    BoxShadow(
+                      color: Color(0x26000000),
+                      blurRadius: 8,
+                      offset: Offset(0, 3),
+                    ),
+                  ],
+                ),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                  child: Text(
+                    '残り時間: ${_formatRemaining(_dungeonRemaining)}',
+                    style: Theme.of(context).textTheme.labelLarge?.copyWith(
+                          fontWeight: FontWeight.w700,
+                          color: Colors.black87,
+                        ),
+                  ),
+                ),
+              ),
+            ],
+          ],
         ),
       );
     }
@@ -1914,7 +1951,7 @@ class _SanpoHomeState extends State<SanpoHome> with WidgetsBindingObserver {
               ],
             ),
             const SizedBox(height: 6),
-            const Text('現在位置から半径600m内にダンジョンを発生します。'),
+            const Text('現在位置から半径500m内にダンジョンを発生します。発見して討伐してください！'),
             const SizedBox(height: 8),
             if (_isDungeonActive)
               Text(
@@ -1937,7 +1974,7 @@ class _SanpoHomeState extends State<SanpoHome> with WidgetsBindingObserver {
                 Expanded(
                   child: FilledButton.icon(
                     onPressed: _isDungeonActive ? null : _startDungeon,
-                    icon: const Icon(Icons.fort),
+                    icon: const Icon(_dungeonIcon),
                     label: Text(_isDungeonActive ? '挑戦中...' : 'ダンジョン発生'),
                   ),
                 ),
