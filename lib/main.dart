@@ -70,7 +70,6 @@ class SanpoHome extends StatefulWidget {
 
 class _SanpoHomeState extends State<SanpoHome> with WidgetsBindingObserver {
   static const double _destinationArrivalThresholdMeters = 35;
-  static const double _municipalityConqueredThreshold = 0.9;
   static const Duration _draftSaveInterval = Duration(seconds: 10);
   static const Duration _dungeonTimeLimit = Duration(minutes: 30);
   static const Duration _dungeonRadarDuration = Duration(minutes: 10);
@@ -114,8 +113,10 @@ class _SanpoHomeState extends State<SanpoHome> with WidgetsBindingObserver {
   // Nominatim 再呼び出し抑制用キャッシュ（-1 = 未取得）
   int _lastMunicipalityCheckRouteCount = -1;
   bool _showSuggestionPanel = true;
-  String? _conqueredMunicipalityName;
-  double _municipalityCoverageRatio = 0;
+  AdministrativeCoverageResult? _prefectureCoverage;
+  AdministrativeCoverageResult? _cityCoverage;
+  AdministrativeCoverageResult? _townCoverage;
+  String? _territoryCoverageError;
   Polyline? _suggestedPolyline;
   RouteSuggestion? _latestSuggestion;
   LatLng? _suggestedDestination;
@@ -182,19 +183,24 @@ class _SanpoHomeState extends State<SanpoHome> with WidgetsBindingObserver {
     final enclosedPolygons = areaCoverageService.extractEnclosedPolygons(routes);
 
     // Nominatim は routes 数が変わった時だけ叩く（レート制限・タブ切替の都度呼び出し防止）
-    MunicipalityCoverageResult? coverage;
+    TerritoryCoverageResult? territoryCoverage;
+    String? territoryCoverageError;
     final routeCountChanged = routes.length != _lastMunicipalityCheckRouteCount;
     if (enclosedPolygons.isNotEmpty && routeCountChanged) {
-      final referencePoint = _resolveCoverageReference(enclosedPolygons);
+      final referencePoint = _latestPosition;
       if (referencePoint != null) {
         try {
-          coverage = await areaCoverageService.estimateMunicipalityCoverage(
+          territoryCoverage = await areaCoverageService.estimateTerritoryCoverage(
             reference: referencePoint,
             coveredPolygons: enclosedPolygons,
           );
+        } on TerritoryCoverageException catch (e) {
+          territoryCoverageError = e.message;
         } catch (_) {
-          coverage = null;
+          territoryCoverageError = '踏破率の取得に失敗しました。';
         }
+      } else {
+        territoryCoverageError = '現在地を取得できないため踏破率を計算できません。';
       }
     }
 
@@ -203,28 +209,33 @@ class _SanpoHomeState extends State<SanpoHome> with WidgetsBindingObserver {
       _displayEnclosedPolygons = enclosedPolygons;
       if (routeCountChanged && enclosedPolygons.isNotEmpty) {
         _lastMunicipalityCheckRouteCount = routes.length;
-        _municipalityCoverageRatio = coverage?.coverageRatio ?? _municipalityCoverageRatio;
-        _conqueredMunicipalityName =
-            (coverage != null &&
-                coverage.coverageRatio >= _municipalityConqueredThreshold)
-            ? coverage.municipalityName
-            : (coverage == null ? _conqueredMunicipalityName : null);
+        _territoryCoverageError = territoryCoverageError;
+        if (territoryCoverage != null) {
+          _prefectureCoverage = territoryCoverage.prefecture;
+          _cityCoverage = territoryCoverage.city;
+          _townCoverage = territoryCoverage.town;
+        } else {
+          _prefectureCoverage = null;
+          _cityCoverage = null;
+          _townCoverage = null;
+        }
       } else if (enclosedPolygons.isEmpty) {
         _lastMunicipalityCheckRouteCount = routes.length;
-        _municipalityCoverageRatio = 0;
-        _conqueredMunicipalityName = null;
+        _prefectureCoverage = null;
+        _cityCoverage = null;
+        _townCoverage = null;
+        _territoryCoverageError = null;
       }
     });
   }
 
-  // 全囲みポリゴンの重心を自治体判定の基準点とする。
-  // 最後の記録点（特定ルートの末尾）ではなく、塗り領域全体の中心を参照する。
-  LatLng? _resolveCoverageReference(List<List<LatLng>> enclosedPolygons) {
-    final allPoints = enclosedPolygons.expand((p) => p).toList();
-    if (allPoints.isEmpty) return null;
-    final avgLat = allPoints.map((p) => p.latitude).reduce((a, b) => a + b) / allPoints.length;
-    final avgLng = allPoints.map((p) => p.longitude).reduce((a, b) => a + b) / allPoints.length;
-    return LatLng(avgLat, avgLng);
+  String _formatCoveragePercent(double ratio) {
+    final value = ((ratio * 100).clamp(0, 100)).toDouble();
+    return value.toStringAsFixed(2).padLeft(5, '0');
+  }
+
+  Widget _buildCoverageRow(String areaName, double ratio) {
+    return Text('$areaName ${_formatCoveragePercent(ratio)}%');
   }
 
   Future<void> _requestLocationPermission() async {
@@ -1594,6 +1605,7 @@ class _SanpoHomeState extends State<SanpoHome> with WidgetsBindingObserver {
           left: 12,
           right: 12,
           child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               if (_showModePanel)
                 Card(
@@ -1658,7 +1670,11 @@ class _SanpoHomeState extends State<SanpoHome> with WidgetsBindingObserver {
                   isSuggestionSupportedPlatform: isSuggestionSupportedPlatform,
                   progressText: progressText,
                 ),
-              if (_selectedMode == PlayMode.territory) _buildTerritoryPanel(),
+              if (_selectedMode == PlayMode.territory)
+                Align(
+                  alignment: Alignment.centerLeft,
+                  child: _buildTerritoryPanel(),
+                ),
               if (_selectedMode == PlayMode.dungeon) _buildDungeonPanel(),
             ],
           ),
@@ -1851,6 +1867,29 @@ class _SanpoHomeState extends State<SanpoHome> with WidgetsBindingObserver {
   }
 
   Widget _buildTerritoryPanel() {
+    if (_territoryCoverageError != null) {
+      return Card(
+        elevation: 2,
+        child: Padding(
+          padding: const EdgeInsets.all(12),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                '陣取りモード',
+                style: TextStyle(fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 6),
+              Text(
+                'エラー: $_territoryCoverageError',
+                style: const TextStyle(color: Colors.redAccent),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
     return Card(
       elevation: 2,
       child: Padding(
@@ -1863,14 +1902,22 @@ class _SanpoHomeState extends State<SanpoHome> with WidgetsBindingObserver {
               style: TextStyle(fontWeight: FontWeight.bold),
             ),
             const SizedBox(height: 6),
-            Text('囲み面数: ${_displayEnclosedPolygons.length}'),
+            const Text('踏破率'),
             const SizedBox(height: 6),
-            Text('自治体踏破率: ${(_municipalityCoverageRatio * 100).toStringAsFixed(0)}%'),
-            if (_conqueredMunicipalityName != null)
-              Padding(
-                padding: const EdgeInsets.only(top: 4),
-                child: Text('制覇: $_conqueredMunicipalityName'),
-              ),
+            _buildCoverageRow(
+              _prefectureCoverage?.areaName ?? '都道府県',
+              _prefectureCoverage?.coverageRatio ?? 0,
+            ),
+            const SizedBox(height: 2),
+            _buildCoverageRow(
+              _cityCoverage?.areaName ?? '市区',
+              _cityCoverage?.coverageRatio ?? 0,
+            ),
+            const SizedBox(height: 2),
+            _buildCoverageRow(
+              _townCoverage?.areaName ?? '町村',
+              _townCoverage?.coverageRatio ?? 0,
+            ),
           ],
         ),
       ),

@@ -18,11 +18,53 @@ class MunicipalityCoverageResult {
   final List<List<LatLng>> boundaryPolygons;
 }
 
+class AdministrativeCoverageResult {
+  AdministrativeCoverageResult({
+    required this.areaName,
+    required this.coverageRatio,
+  });
+
+  final String areaName;
+  final double coverageRatio;
+}
+
+class TerritoryCoverageResult {
+  TerritoryCoverageResult({
+    required this.prefecture,
+    required this.city,
+    required this.town,
+  });
+
+  final AdministrativeCoverageResult prefecture;
+  final AdministrativeCoverageResult city;
+  final AdministrativeCoverageResult town;
+}
+
+class TerritoryCoverageException implements Exception {
+  TerritoryCoverageException(this.message);
+
+  final String message;
+
+  @override
+  String toString() => 'TerritoryCoverageException: $message';
+}
+
+class _AdministrativeBoundaryResult {
+  _AdministrativeBoundaryResult({
+    required this.areaName,
+    required this.boundaryPolygons,
+  });
+
+  final String areaName;
+  final List<List<LatLng>> boundaryPolygons;
+}
+
 class AreaCoverageService {
   static const double _snapThresholdMeters = 20.0;
   static const double _gapCloseMeters = 18.0;
   static const double _minPolygonAreaSqKm = 0.0008;
   static const double _maxPolygonAreaSqKm = 2.0;
+  final Map<int, _AdministrativeBoundaryResult> _administrativeBoundaryCache = {};
 
   List<List<LatLng>> extractEnclosedPolygons(List<WalkRoute> routes) {
     final segmentRoutes = routes.where((route) => route.points.length >= 2).toList();
@@ -146,12 +188,129 @@ class AreaCoverageService {
       return null;
     }
 
+    final boundaryResult = await _resolveAdministrativeBoundary(
+      reference: reference,
+      zoom: 10,
+      areaLabel: '自治体',
+      nameResolver: _extractCityName,
+    );
+    final ratio = _estimateCoverageRatio(
+      boundaryPolygons: boundaryResult.boundaryPolygons,
+      coveredPolygons: coveredPolygons,
+    );
+
+    return MunicipalityCoverageResult(
+      municipalityName: boundaryResult.areaName,
+      coverageRatio: ratio,
+      boundaryPolygons: boundaryResult.boundaryPolygons,
+    );
+  }
+
+  Future<TerritoryCoverageResult?> estimateTerritoryCoverage({
+    required LatLng reference,
+    required List<List<LatLng>> coveredPolygons,
+  }) async {
+    if (coveredPolygons.isEmpty) {
+      return null;
+    }
+
+    final prefecture = await _estimateAdministrativeCoverage(
+      reference: reference,
+      coveredPolygons: coveredPolygons,
+      zoom: 5,
+      areaLabel: '都道府県',
+      nameResolver: (address, json) => _extractPrefectureName(address, json),
+    );
+    final city = await _estimateAdministrativeCoverage(
+      reference: reference,
+      coveredPolygons: coveredPolygons,
+      zoom: 10,
+      areaLabel: '市区',
+      nameResolver: (address, json) => _extractCityName(address, json),
+    );
+    final town = await _estimateAdministrativeCoverage(
+      reference: reference,
+      coveredPolygons: coveredPolygons,
+      zoom: 16,
+      areaLabel: '町村',
+      nameResolver: (address, json) => _extractTownName(address, json),
+    );
+
+    return TerritoryCoverageResult(
+      prefecture: prefecture,
+      city: city,
+      town: town,
+    );
+  }
+
+  Future<AdministrativeCoverageResult> _estimateAdministrativeCoverage({
+    required LatLng reference,
+    required List<List<LatLng>> coveredPolygons,
+    required int zoom,
+    required String areaLabel,
+    required String Function(Map<String, dynamic> address, Map<String, dynamic> json)
+        nameResolver,
+  }) async {
+    final boundaryResult = await _resolveAdministrativeBoundary(
+      reference: reference,
+      zoom: zoom,
+      areaLabel: areaLabel,
+      nameResolver: nameResolver,
+    );
+    final ratio = _estimateCoverageRatio(
+      boundaryPolygons: boundaryResult.boundaryPolygons,
+      coveredPolygons: coveredPolygons,
+    );
+
+    return AdministrativeCoverageResult(
+      areaName: boundaryResult.areaName,
+      coverageRatio: ratio,
+    );
+  }
+
+  Future<_AdministrativeBoundaryResult> _resolveAdministrativeBoundary({
+    required LatLng reference,
+    required int zoom,
+    required String areaLabel,
+    required String Function(Map<String, dynamic> address, Map<String, dynamic> json)
+        nameResolver,
+  }) async {
+    final cached = _administrativeBoundaryCache[zoom];
+    if (cached != null && _isPointInAnyPolygon(reference, cached.boundaryPolygons)) {
+      return cached;
+    }
+
+    final json = await _reverseLookup(reference: reference, zoom: zoom);
+
+    final boundary = _parseBoundaryPolygons(json['geojson']);
+    if (boundary.isEmpty) {
+      throw TerritoryCoverageException('$areaLabel の境界ポリゴンを取得できませんでした。');
+    }
+
+    final address = (json['address'] as Map<String, dynamic>?) ?? const {};
+    final name = nameResolver(address, json);
+    if (name.isEmpty) {
+      throw TerritoryCoverageException('$areaLabel の名称を解決できませんでした。');
+    }
+
+    final result = _AdministrativeBoundaryResult(
+      areaName: name,
+      boundaryPolygons: boundary,
+    );
+    _administrativeBoundaryCache[zoom] = result;
+    return result;
+  }
+
+  Future<Map<String, dynamic>> _reverseLookup({
+    required LatLng reference,
+    required int zoom,
+  }) async {
     final uri = Uri.parse(
       'https://nominatim.openstreetmap.org/reverse'
       '?format=jsonv2'
       '&lat=${reference.latitude}'
       '&lon=${reference.longitude}'
-      '&zoom=10'
+      '&zoom=$zoom'
       '&addressdetails=1'
       '&polygon_geojson=1',
     );
@@ -165,37 +324,60 @@ class AreaCoverageService {
     ).timeout(const Duration(seconds: 15));
 
     if (response.statusCode != 200) {
-      return null;
+      throw TerritoryCoverageException(
+        'Nominatim reverse lookup が失敗しました (HTTP ${response.statusCode}, zoom=$zoom)。',
+      );
     }
 
-    final json = jsonDecode(response.body) as Map<String, dynamic>;
-    final boundary = _parseBoundaryPolygons(json['geojson']);
-    if (boundary.isEmpty) {
-      return null;
+    final json = jsonDecode(response.body);
+    if (json is! Map<String, dynamic>) {
+      throw TerritoryCoverageException('Nominatim の応答形式が不正です (zoom=$zoom)。');
     }
-
-    final name = _extractMunicipalityName(json);
-    final ratio = _estimateCoverageRatio(
-      boundaryPolygons: boundary,
-      coveredPolygons: coveredPolygons,
-    );
-
-    return MunicipalityCoverageResult(
-      municipalityName: name,
-      coverageRatio: ratio,
-      boundaryPolygons: boundary,
-    );
+    return json;
   }
 
-  static String _extractMunicipalityName(Map<String, dynamic> json) {
-    final address = (json['address'] as Map<String, dynamic>?) ?? const {};
+  static bool _isPointInAnyPolygon(LatLng point, List<List<LatLng>> polygons) {
+    return polygons.any((polygon) => _pointInPolygon(point, polygon));
+  }
+
+  static String _extractPrefectureName(
+    Map<String, dynamic> address,
+    Map<String, dynamic> json,
+  ) {
+    return (address['state'] as String?) ??
+        (address['province'] as String?) ??
+        (address['region'] as String?) ??
+        (json['name'] as String?) ??
+        '';
+  }
+
+  static String _extractCityName(
+    Map<String, dynamic> address,
+    Map<String, dynamic> json,
+  ) {
     return (address['city'] as String?) ??
-        (address['town'] as String?) ??
-        (address['village'] as String?) ??
+        (address['city_district'] as String?) ??
         (address['municipality'] as String?) ??
         (address['county'] as String?) ??
+        (address['town'] as String?) ??
+        (address['village'] as String?) ??
         (json['name'] as String?) ??
-        '自治体';
+          '';
+  }
+
+  static String _extractTownName(
+    Map<String, dynamic> address,
+    Map<String, dynamic> json,
+  ) {
+    return (address['quarter'] as String?) ??
+        (address['neighbourhood'] as String?) ??
+        (address['suburb'] as String?) ??
+        (address['hamlet'] as String?) ??
+        (address['town'] as String?) ??
+        (address['village'] as String?) ??
+        (address['city_district'] as String?) ??
+        (json['name'] as String?) ??
+          '';
   }
 
   static List<List<LatLng>> _parseBoundaryPolygons(dynamic geojson) {
