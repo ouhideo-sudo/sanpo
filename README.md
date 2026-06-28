@@ -54,6 +54,18 @@ flutter test
 flutter build apk --debug
 ```
 
+### 端末データのバックアップ/復元
+
+端末の記録データは `device_backup/` に保存した `.tar.gz` バックアップから戻せます。
+
+復元スクリプトは、いったんデバッグ版 APK を上書きして `run-as` を有効化し、そのあとで `shared_prefs` / `databases` / `files` を復元してから通常版へ戻します。
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\restore_sanpo_backup.ps1
+```
+
+最新のバックアップではなく任意のファイルを使う場合は `-BackupPath` を指定します。
+
 ## ファイル構成
 
 ```

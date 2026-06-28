@@ -29,6 +29,9 @@ class MainActivity : FlutterActivity() {
 						}
 					}
 
+						"getAppDataDir" -> result.success(applicationInfo.dataDir)
+					"getExternalFilesDir" -> result.success(getExternalFilesDir(null)?.absolutePath.orEmpty())
+
 					else -> result.notImplemented()
 				}
 			}

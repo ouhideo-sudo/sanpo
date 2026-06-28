@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
 
@@ -56,6 +57,18 @@ class _AdministrativeBoundaryResult {
   });
 
   final String areaName;
+  final List<List<LatLng>> boundaryPolygons;
+}
+
+class _CoverageLayerResult {
+  _CoverageLayerResult({
+    required this.areaName,
+    required this.coverageRatio,
+    required this.boundaryPolygons,
+  });
+
+  final String areaName;
+  final double coverageRatio;
   final List<List<LatLng>> boundaryPolygons;
 }
 
@@ -188,66 +201,75 @@ class AreaCoverageService {
       return null;
     }
 
-    final boundaryResult = await _resolveAdministrativeBoundary(
+    final coverage = await _estimateCoverageLayer(
       reference: reference,
+      coveredPolygons: coveredPolygons,
       zoom: 10,
       areaLabel: '自治体',
+      sampleSteps: 90,
       nameResolver: _extractCityName,
-    );
-    final ratio = _estimateCoverageRatio(
-      boundaryPolygons: boundaryResult.boundaryPolygons,
-      coveredPolygons: coveredPolygons,
     );
 
     return MunicipalityCoverageResult(
-      municipalityName: boundaryResult.areaName,
-      coverageRatio: ratio,
-      boundaryPolygons: boundaryResult.boundaryPolygons,
+      municipalityName: coverage.areaName,
+      coverageRatio: coverage.coverageRatio,
+      boundaryPolygons: coverage.boundaryPolygons,
     );
   }
 
-  Future<TerritoryCoverageResult?> estimateTerritoryCoverage({
+  Future<TerritoryCoverageResult> estimateTerritoryCoverage({
     required LatLng reference,
     required List<List<LatLng>> coveredPolygons,
   }) async {
-    if (coveredPolygons.isEmpty) {
-      return null;
-    }
-
-    final prefecture = await _estimateAdministrativeCoverage(
+    final prefecture = await _estimateCoverageLayer(
       reference: reference,
       coveredPolygons: coveredPolygons,
       zoom: 5,
       areaLabel: '都道府県',
+      sampleSteps: 90,
       nameResolver: (address, json) => _extractPrefectureName(address, json),
     );
-    final city = await _estimateAdministrativeCoverage(
+
+    final city = await _estimateCoverageLayer(
       reference: reference,
       coveredPolygons: coveredPolygons,
       zoom: 10,
       areaLabel: '市区',
+      sampleSteps: 120,
       nameResolver: (address, json) => _extractCityName(address, json),
     );
-    final town = await _estimateAdministrativeCoverage(
+
+    final town = await _estimateCoverageLayerWithZoomFallback(
       reference: reference,
       coveredPolygons: coveredPolygons,
-      zoom: 16,
+      zoomCandidates: const [18, 17, 16, 15],
       areaLabel: '町村',
+      sampleSteps: 240,
       nameResolver: (address, json) => _extractTownName(address, json),
     );
 
     return TerritoryCoverageResult(
-      prefecture: prefecture,
-      city: city,
-      town: town,
+      prefecture: AdministrativeCoverageResult(
+        areaName: prefecture.areaName,
+        coverageRatio: prefecture.coverageRatio,
+      ),
+      city: AdministrativeCoverageResult(
+        areaName: city.areaName,
+        coverageRatio: city.coverageRatio,
+      ),
+      town: AdministrativeCoverageResult(
+        areaName: town.areaName,
+        coverageRatio: town.coverageRatio,
+      ),
     );
   }
 
-  Future<AdministrativeCoverageResult> _estimateAdministrativeCoverage({
+  Future<_CoverageLayerResult> _estimateCoverageLayer({
     required LatLng reference,
     required List<List<LatLng>> coveredPolygons,
     required int zoom,
     required String areaLabel,
+    required int sampleSteps,
     required String Function(Map<String, dynamic> address, Map<String, dynamic> json)
         nameResolver,
   }) async {
@@ -260,12 +282,42 @@ class AreaCoverageService {
     final ratio = _estimateCoverageRatio(
       boundaryPolygons: boundaryResult.boundaryPolygons,
       coveredPolygons: coveredPolygons,
+      steps: sampleSteps,
     );
 
-    return AdministrativeCoverageResult(
+    return _CoverageLayerResult(
       areaName: boundaryResult.areaName,
       coverageRatio: ratio,
+      boundaryPolygons: boundaryResult.boundaryPolygons,
     );
+  }
+
+  Future<_CoverageLayerResult> _estimateCoverageLayerWithZoomFallback({
+    required LatLng reference,
+    required List<List<LatLng>> coveredPolygons,
+    required List<int> zoomCandidates,
+    required String areaLabel,
+    required int sampleSteps,
+    required String Function(Map<String, dynamic> address, Map<String, dynamic> json)
+        nameResolver,
+  }) async {
+    TerritoryCoverageException? lastError;
+    for (final zoom in zoomCandidates) {
+      try {
+        return await _estimateCoverageLayer(
+          reference: reference,
+          coveredPolygons: coveredPolygons,
+          zoom: zoom,
+          areaLabel: areaLabel,
+          sampleSteps: sampleSteps,
+          nameResolver: nameResolver,
+        );
+      } on TerritoryCoverageException catch (e) {
+        lastError = e;
+      }
+    }
+
+    throw lastError ?? TerritoryCoverageException('$areaLabel の取得に失敗しました。');
   }
 
   Future<_AdministrativeBoundaryResult> _resolveAdministrativeBoundary({
@@ -315,13 +367,20 @@ class AreaCoverageService {
       '&polygon_geojson=1',
     );
 
-    final response = await http.get(
-      uri,
-      headers: const {
-        'User-Agent': 'sanpo-app/1.0 (route-coverage-feature)',
-        'Accept': 'application/json',
-      },
-    ).timeout(const Duration(seconds: 15));
+    http.Response response;
+    try {
+      response = await http.get(
+        uri,
+        headers: const {
+          'User-Agent': 'sanpo-app/1.0 (route-coverage-feature)',
+          'Accept': 'application/json',
+        },
+      ).timeout(const Duration(seconds: 15));
+    } on TimeoutException {
+      throw TerritoryCoverageException('通信がタイムアウトしました (zoom=$zoom)。');
+    } catch (_) {
+      throw TerritoryCoverageException('Nominatim への通信に失敗しました (zoom=$zoom)。');
+    }
 
     if (response.statusCode != 200) {
       throw TerritoryCoverageException(
@@ -369,15 +428,106 @@ class AreaCoverageService {
     Map<String, dynamic> address,
     Map<String, dynamic> json,
   ) {
-    return (address['quarter'] as String?) ??
-        (address['neighbourhood'] as String?) ??
-        (address['suburb'] as String?) ??
-        (address['hamlet'] as String?) ??
-        (address['town'] as String?) ??
-        (address['village'] as String?) ??
-        (address['city_district'] as String?) ??
-        (json['name'] as String?) ??
-          '';
+    final cityName = _extractCityName(address, json);
+    final candidates = <String?>[
+      address['neighbourhood'] as String?,
+      address['city_block'] as String?,
+      address['block'] as String?,
+      address['residential'] as String?,
+      json['name'] as String?,
+      address['quarter'] as String?,
+      address['suburb'] as String?,
+      address['district'] as String?,
+      address['borough'] as String?,
+      address['allotments'] as String?,
+      address['hamlet'] as String?,
+      address['town'] as String?,
+      address['village'] as String?,
+      address['city_district'] as String?,
+    ];
+
+    for (final candidate in candidates) {
+      final value = candidate?.trim();
+      if (value == null || value.isEmpty) {
+        continue;
+      }
+      if (value == cityName) {
+        continue;
+      }
+      return _normalizeChomeNumerals(value);
+    }
+
+    return '';
+  }
+
+  static String _normalizeChomeNumerals(String input) {
+    final pattern = RegExp(r'([〇零一二三四五六七八九十]+)丁目');
+    return input.replaceAllMapped(pattern, (match) {
+      final japaneseNumber = match.group(1)!;
+      final parsed = _parseJapaneseNumber(japaneseNumber);
+      if (parsed == null) {
+        return match.group(0)!;
+      }
+      return '$parsed丁目';
+    });
+  }
+
+  static int? _parseJapaneseNumber(String value) {
+    if (value.isEmpty) {
+      return null;
+    }
+
+    final digits = <String, int>{
+      '〇': 0,
+      '零': 0,
+      '一': 1,
+      '二': 2,
+      '三': 3,
+      '四': 4,
+      '五': 5,
+      '六': 6,
+      '七': 7,
+      '八': 8,
+      '九': 9,
+    };
+
+    if (!value.contains('十')) {
+      final parsed = value.split('').map((c) => digits[c]).toList();
+      if (parsed.any((n) => n == null)) {
+        return null;
+      }
+      return parsed.cast<int>().fold<int>(0, (acc, n) => acc * 10 + n);
+    }
+
+    final parts = value.split('十');
+    if (parts.length != 2) {
+      return null;
+    }
+
+    final tensPart = parts[0];
+    final onesPart = parts[1];
+
+    int tens;
+    if (tensPart.isEmpty) {
+      tens = 1;
+    } else {
+      final digit = digits[tensPart];
+      if (digit == null || digit == 0) {
+        return null;
+      }
+      tens = digit;
+    }
+
+    var ones = 0;
+    if (onesPart.isNotEmpty) {
+      final digit = digits[onesPart];
+      if (digit == null) {
+        return null;
+      }
+      ones = digit;
+    }
+
+    return tens * 10 + ones;
   }
 
   static List<List<LatLng>> _parseBoundaryPolygons(dynamic geojson) {
@@ -387,6 +537,34 @@ class AreaCoverageService {
 
     final type = geojson['type'] as String?;
     final coordinates = geojson['coordinates'];
+
+    if (type == 'Feature') {
+      return _parseBoundaryPolygons(geojson['geometry']);
+    }
+
+    if (type == 'FeatureCollection') {
+      final features = geojson['features'];
+      if (features is! List) {
+        return [];
+      }
+      final polygons = <List<LatLng>>[];
+      for (final feature in features) {
+        polygons.addAll(_parseBoundaryPolygons(feature));
+      }
+      return polygons;
+    }
+
+    if (type == 'GeometryCollection') {
+      final geometries = geojson['geometries'];
+      if (geometries is! List) {
+        return [];
+      }
+      final polygons = <List<LatLng>>[];
+      for (final geometry in geometries) {
+        polygons.addAll(_parseBoundaryPolygons(geometry));
+      }
+      return polygons;
+    }
 
     if (type == 'Polygon' && coordinates is List && coordinates.isNotEmpty) {
       return [_toLatLngList(coordinates.first)];
@@ -424,13 +602,14 @@ class AreaCoverageService {
   static double _estimateCoverageRatio({
     required List<List<LatLng>> boundaryPolygons,
     required List<List<LatLng>> coveredPolygons,
+    int steps = 90,
   }) {
     final bounds = _boundsOf(boundaryPolygons.expand((e) => e).toList());
     if (bounds == null) {
       return 0;
     }
 
-    const steps = 90;
+    steps = steps.clamp(60, 360);
     var insideCount = 0;
     var coveredCount = 0;
 

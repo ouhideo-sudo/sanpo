@@ -1,8 +1,11 @@
 import 'dart:async';
+import 'dart:io';
 import 'dart:math';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:archive/archive.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:package_info_plus/package_info_plus.dart';
@@ -17,8 +20,69 @@ import 'config/api_keys.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  await _restoreBackupArchiveIfPresent();
   final prefs = await SharedPreferences.getInstance();
   runApp(MyApp(prefs: prefs));
+}
+
+Future<void> _restoreBackupArchiveIfPresent() async {
+  if (!Platform.isAndroid) return;
+  try {
+    final appPaths = await _getAppPaths();
+    final archiveFile = File('${appPaths.externalFilesDir}/restore_backup.tar');
+    if (!await archiveFile.exists()) return;
+
+    final bytes = await archiveFile.readAsBytes();
+    // 処理前に削除 — 破損データによるブートループを防ぐ
+    await archiveFile.delete();
+
+    final payload = _maybeDecompressGzip(bytes);
+    final archive = TarDecoder().decodeBytes(payload);
+    final appDataDir = appPaths.appDataDir;
+
+    for (final entry in archive) {
+      if (!entry.isFile) continue;
+
+      final normalizedName = entry.name.startsWith('./')
+          ? entry.name.substring(2)
+          : entry.name;
+
+      if (normalizedName.startsWith('cache/')) continue;
+      // パストラバーサル対策
+      if (normalizedName.contains('..') || normalizedName.startsWith('/')) continue;
+
+      debugPrint('Restoring archive entry: $normalizedName');
+      final target = File('$appDataDir/$normalizedName');
+      await target.parent.create(recursive: true);
+      await target.writeAsBytes(entry.content as List<int>, flush: true);
+    }
+    debugPrint('Backup archive restore completed.');
+  } catch (e, st) {
+    debugPrint('Backup restore failed (ignored): $e\n$st');
+  }
+}
+
+Future<({String appDataDir, String externalFilesDir})> _getAppPaths() async {
+  const channel = MethodChannel('sanpo/config');
+  final appDataDir = await channel.invokeMethod<String>('getAppDataDir');
+  final externalFilesDir = await channel.invokeMethod<String>('getExternalFilesDir');
+
+  if (appDataDir == null || appDataDir.isEmpty) {
+    throw StateError('Failed to resolve app data directory.');
+  }
+  if (externalFilesDir == null || externalFilesDir.isEmpty) {
+    throw StateError('Failed to resolve external files directory.');
+  }
+
+  return (appDataDir: appDataDir, externalFilesDir: externalFilesDir);
+}
+
+List<int> _maybeDecompressGzip(List<int> bytes) {
+  if (bytes.length < 2 || bytes[0] != 0x1f || bytes[1] != 0x8b) {
+    return bytes;
+  }
+
+  return GZipDecoder().decodeBytes(bytes);
 }
 
 class MyApp extends StatelessWidget {
@@ -70,6 +134,10 @@ class SanpoHome extends StatefulWidget {
 
 class _SanpoHomeState extends State<SanpoHome> with WidgetsBindingObserver {
   static const double _destinationArrivalThresholdMeters = 35;
+  static const double _maxGpsAccuracyMeters = 50.0;
+  static const double _maxWarpSpeedMps = 30.0;
+  static const Duration _territoryCoverageRefreshInterval = Duration(seconds: 20);
+  static const double _territoryCoverageRefreshDistanceMeters = 120;
   static const Duration _draftSaveInterval = Duration(seconds: 10);
   static const Duration _dungeonTimeLimit = Duration(minutes: 30);
   static const Duration _dungeonRadarDuration = Duration(minutes: 10);
@@ -117,6 +185,9 @@ class _SanpoHomeState extends State<SanpoHome> with WidgetsBindingObserver {
   AdministrativeCoverageResult? _cityCoverage;
   AdministrativeCoverageResult? _townCoverage;
   String? _territoryCoverageError;
+  DateTime? _lastTerritoryCoverageUpdatedAt;
+  LatLng? _lastTerritoryCoverageReference;
+  bool _isRefreshingTerritoryCoverage = false;
   Polyline? _suggestedPolyline;
   RouteSuggestion? _latestSuggestion;
   LatLng? _suggestedDestination;
@@ -145,6 +216,7 @@ class _SanpoHomeState extends State<SanpoHome> with WidgetsBindingObserver {
   bool _showDungeonResult = false;
   String _dungeonResultMessage = '';
   LatLng? _latestPosition;
+  DateTime? _lastRoutePointTime;
   Offset? _radarButtonOffset;
   double? _radarArrowAngle;
   bool _isRefreshingRadarControl = false;
@@ -182,51 +254,149 @@ class _SanpoHomeState extends State<SanpoHome> with WidgetsBindingObserver {
     final routes = await routeService.getRoutes();
     final enclosedPolygons = areaCoverageService.extractEnclosedPolygons(routes);
 
-    // Nominatim は routes 数が変わった時だけ叩く（レート制限・タブ切替の都度呼び出し防止）
-    TerritoryCoverageResult? territoryCoverage;
-    String? territoryCoverageError;
     final routeCountChanged = routes.length != _lastMunicipalityCheckRouteCount;
-    if (enclosedPolygons.isNotEmpty && routeCountChanged) {
-      final referencePoint = _latestPosition;
-      if (referencePoint != null) {
-        try {
-          territoryCoverage = await areaCoverageService.estimateTerritoryCoverage(
-            reference: referencePoint,
-            coveredPolygons: enclosedPolygons,
-          );
-        } on TerritoryCoverageException catch (e) {
-          territoryCoverageError = e.message;
-        } catch (_) {
-          territoryCoverageError = '踏破率の取得に失敗しました。';
-        }
-      } else {
-        territoryCoverageError = '現在地を取得できないため踏破率を計算できません。';
-      }
-    }
 
     setState(() {
       _savedRoutes = routes;
       _displayEnclosedPolygons = enclosedPolygons;
-      if (routeCountChanged && enclosedPolygons.isNotEmpty) {
+      if (routeCountChanged) {
         _lastMunicipalityCheckRouteCount = routes.length;
-        _territoryCoverageError = territoryCoverageError;
-        if (territoryCoverage != null) {
-          _prefectureCoverage = territoryCoverage.prefecture;
-          _cityCoverage = territoryCoverage.city;
-          _townCoverage = territoryCoverage.town;
-        } else {
-          _prefectureCoverage = null;
-          _cityCoverage = null;
-          _townCoverage = null;
-        }
-      } else if (enclosedPolygons.isEmpty) {
-        _lastMunicipalityCheckRouteCount = routes.length;
+      }
+      if (enclosedPolygons.isEmpty) {
         _prefectureCoverage = null;
         _cityCoverage = null;
         _townCoverage = null;
         _territoryCoverageError = null;
+        _lastTerritoryCoverageUpdatedAt = null;
+        _lastTerritoryCoverageReference = null;
       }
     });
+
+    if (routeCountChanged && enclosedPolygons.isNotEmpty) {
+      await _refreshTerritoryCoverageForCurrentPosition(force: true);
+    }
+  }
+
+  Future<void> _refreshTerritoryCoverageForCurrentPosition({bool force = false}) async {
+    if (_displayEnclosedPolygons.isEmpty) {
+      if (mounted) {
+        setState(() {
+          _prefectureCoverage = null;
+          _cityCoverage = null;
+          _townCoverage = null;
+          _territoryCoverageError = null;
+          _lastTerritoryCoverageUpdatedAt = null;
+          _lastTerritoryCoverageReference = null;
+        });
+      }
+      return;
+    }
+
+    final referencePoint = await _resolveCurrentPositionForTerritoryCoverage();
+    if (referencePoint == null) {
+      if (force && mounted) {
+        setState(() {
+          _territoryCoverageError = '現在地を取得できないため踏破率を計算できません。位置情報設定を確認してください。';
+        });
+      }
+      return;
+    }
+    if (_isRefreshingTerritoryCoverage) {
+      return;
+    }
+
+    if (!force) {
+      final lastUpdatedAt = _lastTerritoryCoverageUpdatedAt;
+      if (lastUpdatedAt != null &&
+          DateTime.now().difference(lastUpdatedAt) < _territoryCoverageRefreshInterval) {
+        return;
+      }
+
+      final lastReference = _lastTerritoryCoverageReference;
+      if (lastReference != null) {
+        final movedMeters = Geolocator.distanceBetween(
+          lastReference.latitude,
+          lastReference.longitude,
+          referencePoint.latitude,
+          referencePoint.longitude,
+        );
+        if (movedMeters < _territoryCoverageRefreshDistanceMeters) {
+          return;
+        }
+      }
+    }
+
+    _isRefreshingTerritoryCoverage = true;
+    try {
+      final territoryCoverage = await areaCoverageService.estimateTerritoryCoverage(
+        reference: referencePoint,
+        coveredPolygons: _displayEnclosedPolygons,
+      );
+
+      _lastTerritoryCoverageUpdatedAt = DateTime.now();
+      _lastTerritoryCoverageReference = referencePoint;
+
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _territoryCoverageError = null;
+        _prefectureCoverage = territoryCoverage.prefecture;
+        _cityCoverage = territoryCoverage.city;
+        _townCoverage = territoryCoverage.town;
+      });
+    } on TerritoryCoverageException catch (e) {
+      _lastTerritoryCoverageUpdatedAt = DateTime.now();
+      _lastTerritoryCoverageReference = referencePoint;
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _prefectureCoverage = null;
+        _cityCoverage = null;
+        _townCoverage = null;
+        _territoryCoverageError = e.message;
+      });
+    } catch (_) {
+      _lastTerritoryCoverageUpdatedAt = DateTime.now();
+      _lastTerritoryCoverageReference = referencePoint;
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _prefectureCoverage = null;
+        _cityCoverage = null;
+        _townCoverage = null;
+        _territoryCoverageError = '踏破率の取得に失敗しました。';
+      });
+    } finally {
+      _isRefreshingTerritoryCoverage = false;
+    }
+  }
+
+  Future<LatLng?> _resolveCurrentPositionForTerritoryCoverage() async {
+    if (_latestPosition != null) {
+      return _latestPosition;
+    }
+
+    try {
+      final lastKnown = await Geolocator.getLastKnownPosition();
+      if (lastKnown != null) {
+        final latLng = LatLng(lastKnown.latitude, lastKnown.longitude);
+        _latestPosition = latLng;
+        return latLng;
+      }
+
+      final current = await Geolocator.getCurrentPosition(
+        desiredAccuracy: LocationAccuracy.high,
+      );
+      final latLng = LatLng(current.latitude, current.longitude);
+      _latestPosition = latLng;
+      return latLng;
+    } catch (_) {
+      return null;
+    }
   }
 
   String _formatCoveragePercent(double ratio) {
@@ -420,22 +590,38 @@ class _SanpoHomeState extends State<SanpoHome> with WidgetsBindingObserver {
   Future<void> _handlePositionUpdate(Position position) async {
     final latLng = LatLng(position.latitude, position.longitude);
     _latestPosition = latLng;
+    if (_selectedMode == PlayMode.territory) {
+      unawaited(_refreshTerritoryCoverageForCurrentPosition());
+    }
     unawaited(_refreshRadarButtonOffset());
     await _updateDungeonByPosition(latLng);
     if (!_isRecording) {
       return;
     }
 
-    final isDuplicatePoint = _currentRoute.isNotEmpty &&
-        Geolocator.distanceBetween(
-              _currentRoute.last.latitude,
-              _currentRoute.last.longitude,
-              latLng.latitude,
-              latLng.longitude,
-            ) <
-            3;
-    if (isDuplicatePoint) {
+    if (position.accuracy > _maxGpsAccuracyMeters) {
       return;
+    }
+
+    if (_currentRoute.isNotEmpty) {
+      final distMeters = Geolocator.distanceBetween(
+        _currentRoute.last.latitude,
+        _currentRoute.last.longitude,
+        latLng.latitude,
+        latLng.longitude,
+      );
+
+      if (distMeters < 3) {
+        return;
+      }
+
+      final lastTime = _lastRoutePointTime;
+      if (lastTime != null) {
+        final elapsedSeconds = DateTime.now().difference(lastTime).inMilliseconds / 1000.0;
+        if (elapsedSeconds > 0 && distMeters / elapsedSeconds > _maxWarpSpeedMps) {
+          return;
+        }
+      }
     }
 
     if (mounted) {
@@ -445,6 +631,7 @@ class _SanpoHomeState extends State<SanpoHome> with WidgetsBindingObserver {
     } else {
       _currentRoute.add(latLng);
     }
+    _lastRoutePointTime = DateTime.now();
 
     await _persistActiveDraft();
 
@@ -469,6 +656,9 @@ class _SanpoHomeState extends State<SanpoHome> with WidgetsBindingObserver {
     try {
       final position = await Geolocator.getCurrentPosition();
       _latestPosition = LatLng(position.latitude, position.longitude);
+      if (_selectedMode == PlayMode.territory) {
+        unawaited(_refreshTerritoryCoverageForCurrentPosition(force: true));
+      }
       unawaited(_refreshRadarButtonOffset());
       await _animateMapCameraSafely(
         CameraUpdate.newLatLngZoom(
@@ -515,6 +705,9 @@ class _SanpoHomeState extends State<SanpoHome> with WidgetsBindingObserver {
         _showDungeonPanel = true;
       }
     });
+    if (mode == PlayMode.territory) {
+      unawaited(_refreshTerritoryCoverageForCurrentPosition(force: true));
+    }
     unawaited(_refreshRadarButtonOffset());
   }
 
@@ -1072,6 +1265,7 @@ class _SanpoHomeState extends State<SanpoHome> with WidgetsBindingObserver {
       _recordingStartTime = DateTime.now();
     });
     _lastDraftSavedAt = null;
+    _lastRoutePointTime = null;
     await _persistActiveDraft(force: true);
     final success = await _startPositionTracking();
     if (!success && mounted) {
@@ -1679,6 +1873,25 @@ class _SanpoHomeState extends State<SanpoHome> with WidgetsBindingObserver {
             ],
           ),
         ),
+        if (!_showModePanel)
+          Positioned(
+            top: 12,
+            right: 12,
+            child: Card(
+              margin: EdgeInsets.zero,
+              elevation: 2,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: IconButton(
+                tooltip: '現在地に移動',
+                onPressed: () {
+                  unawaited(_getCurrentLocation(mapGeneration: _mapControllerGeneration));
+                },
+                icon: const Icon(Icons.my_location),
+              ),
+            ),
+          ),
         if (_showDungeonResult)
           Positioned.fill(
             child: ColoredBox(

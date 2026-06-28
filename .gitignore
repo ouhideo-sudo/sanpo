@@ -43,3 +43,13 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# Device backups (personal data)
+/device_backup/
+
+# Local Claude settings
+.claude/settings.local.json
+
+# Scratch artifacts (screenshots / UI dumps)
+/sanpo_screen*.png
+/ui.xml
