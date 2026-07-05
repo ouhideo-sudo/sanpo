@@ -2126,11 +2126,15 @@ class _SanpoHomeState extends State<SanpoHome> with WidgetsBindingObserver {
               _cityCoverage?.areaName ?? '市区',
               _cityCoverage?.coverageRatio ?? 0,
             ),
-            const SizedBox(height: 2),
-            _buildCoverageRow(
-              _townCoverage?.areaName ?? '町村',
-              _townCoverage?.coverageRatio ?? 0,
-            ),
+            // 町層は丁目境界があれば丁目、無ければ約500mメッシュ(「〇〇周辺」)を
+            // 表示する。初回計算前(_townCoverage == null)のみ行を出さない。
+            if (_townCoverage != null) ...[
+              const SizedBox(height: 2),
+              _buildCoverageRow(
+                _townCoverage!.areaName,
+                _townCoverage!.coverageRatio,
+              ),
+            ],
           ],
         ),
       ),

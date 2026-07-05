@@ -5,7 +5,7 @@
 - Administrative coverage is represented by `AdministrativeCoverageResult` and `TerritoryCoverageResult`.
 - Reverse lookup failures should be surfaced with `TerritoryCoverageException` and shown as UI error text.
 - Territory panel administrative names should follow the user's current location with throttled refresh behavior.
-- Town coverage should use the same reverse lookup boundary result as the displayed town name to avoid name/coverage mismatches.
+- Town (丁目) coverage resolves the chome name via reverse lookup, then forward-searches Nominatim for its administrative boundary polygon (many Japanese chome have no boundary in OSM). Where no boundary exists—or the city name is unknown—it falls back to a ~500m JIS standard mesh cell labeled "〇〇周辺", so the town layer is normally non-null. The forward search runs only when the city name is present, to avoid matching a same-named chome in another municipality.
 - Recorded route points drop low-accuracy GPS fixes and "warp" jumps in `_handlePositionUpdate` (`lib/main.dart`); keep those noise filters when touching recording.
 
 ## Device Data Restore Subsystem

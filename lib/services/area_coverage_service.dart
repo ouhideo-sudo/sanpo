@@ -26,6 +26,8 @@ class AdministrativeCoverageResult {
   });
 
   final String areaName;
+
+  /// 踏破率(0.0〜1.0)。
   final double coverageRatio;
 }
 
@@ -38,7 +40,11 @@ class TerritoryCoverageResult {
 
   final AdministrativeCoverageResult prefecture;
   final AdministrativeCoverageResult city;
-  final AdministrativeCoverageResult town;
+
+  /// 町(丁目)層。丁目境界があれば丁目、無ければ約500mメッシュ(「〇〇周辺」)で
+  /// 必ず算出するため通常は非null。null になるのは初回計算前と、上位で予期しない
+  /// エラーが起きたときのみ。UI では null の間だけ行を出さない。
+  final AdministrativeCoverageResult? town;
 }
 
 class TerritoryCoverageException implements Exception {
@@ -78,6 +84,9 @@ class AreaCoverageService {
   static const double _minPolygonAreaSqKm = 0.0008;
   static const double _maxPolygonAreaSqKm = 2.0;
   final Map<int, _AdministrativeBoundaryResult> _administrativeBoundaryCache = {};
+  // 丁目境界の forward search 結果キャッシュ('市区名/丁目名' -> ポリゴン)。
+  // 空リストは「境界が存在しないと確認済み」を表す。
+  final Map<String, List<List<LatLng>>> _townBoundaryCache = {};
 
   List<List<LatLng>> extractEnclosedPolygons(List<WalkRoute> routes) {
     final segmentRoutes = routes.where((route) => route.points.length >= 2).toList();
@@ -239,14 +248,19 @@ class AreaCoverageService {
       nameResolver: (address, json) => _extractCityName(address, json),
     );
 
-    final town = await _estimateCoverageLayerWithZoomFallback(
-      reference: reference,
-      coveredPolygons: coveredPolygons,
-      zoomCandidates: const [18, 17, 16, 15],
-      areaLabel: '町村',
-      sampleSteps: 240,
-      nameResolver: (address, json) => _extractTownName(address, json),
-    );
+    // 町(丁目)層は _estimateTownCoverage 内でエラーをメッシュにフォールバックする
+    // ため通常は非nullを返す。ここでの catch は万一の想定外例外に対する保険で、
+    // 町層が失敗しても都道府県・市区の表示を維持するためのもの。
+    AdministrativeCoverageResult? town;
+    try {
+      town = await _estimateTownCoverage(
+        reference: reference,
+        coveredPolygons: coveredPolygons,
+        sampleSteps: 240,
+      );
+    } on TerritoryCoverageException {
+      town = null;
+    }
 
     return TerritoryCoverageResult(
       prefecture: AdministrativeCoverageResult(
@@ -257,11 +271,75 @@ class AreaCoverageService {
         areaName: city.areaName,
         coverageRatio: city.coverageRatio,
       ),
-      town: AdministrativeCoverageResult(
-        areaName: town.areaName,
-        coverageRatio: town.coverageRatio,
-      ),
+      town: town,
     );
+  }
+
+  /// 町(丁目)の踏破率を推定する。
+  ///
+  /// 逆ジオコーディングは高ズームでも「最も近い建物・道路」を返すだけで丁目の
+  /// 行政境界を返さないため、丁目名を取得したうえで forward search し、
+  /// 行政境界(boundary)のポリゴンを取得する。境界がOSMに無い地域(例: 市川市
+  /// 大洲三丁目 はポイントのみ)や解決に失敗した場合は、約500mの標準地域メッシュ
+  /// にフォールバックして必ず踏破率を返す。
+  Future<AdministrativeCoverageResult?> _estimateTownCoverage({
+    required LatLng reference,
+    required List<List<LatLng>> coveredPolygons,
+    required int sampleSteps,
+  }) async {
+    String? townName;
+    try {
+      final resolved = await _resolveTownAddress(reference: reference);
+      if (resolved != null) {
+        townName = _normalizeChomeNumerals(resolved.rawTownName);
+        final boundary = await _resolveTownBoundary(
+          rawTownName: resolved.rawTownName,
+          cityName: resolved.cityName,
+        );
+        if (boundary != null && boundary.isNotEmpty) {
+          final ratio = _estimateCoverageRatio(
+            boundaryPolygons: boundary,
+            coveredPolygons: coveredPolygons,
+            steps: sampleSteps,
+          );
+          return AdministrativeCoverageResult(
+            areaName: townName,
+            coverageRatio: ratio,
+          );
+        }
+      }
+    } on TerritoryCoverageException {
+      // 丁目名・境界の解決に失敗してもメッシュにフォールバックする。
+    }
+
+    // フォールバック: 約500m四方の標準地域メッシュを対象エリアとする。
+    final meshRatio = _estimateCoverageRatio(
+      boundaryPolygons: [_standardMeshCell(reference)],
+      coveredPolygons: coveredPolygons,
+      steps: sampleSteps,
+    );
+    return AdministrativeCoverageResult(
+      areaName: townName == null ? '現在地周辺' : '$townName周辺',
+      coverageRatio: meshRatio,
+    );
+  }
+
+  /// 地域メッシュ(JIS X 0410)の4次メッシュ相当(約500m四方)のセルを返す。
+  /// 丁目境界が無い地域で踏破率の対象エリアとして使う。全国共通のグリッドに
+  /// スナップするため、同じ場所では常に同じセルになる。
+  static List<LatLng> _standardMeshCell(LatLng point) {
+    const latStep = 1.0 / 240.0; // 緯度15秒 ≒ 約460m
+    const lonStep = 1.0 / 160.0; // 経度22.5秒 ≒ 約570m(北緯35度付近)
+    final latMin = (point.latitude / latStep).floorToDouble() * latStep;
+    final lonMin = (point.longitude / lonStep).floorToDouble() * lonStep;
+    final latMax = latMin + latStep;
+    final lonMax = lonMin + lonStep;
+    return [
+      LatLng(latMin, lonMin),
+      LatLng(latMin, lonMax),
+      LatLng(latMax, lonMax),
+      LatLng(latMax, lonMin),
+    ];
   }
 
   Future<_CoverageLayerResult> _estimateCoverageLayer({
@@ -290,34 +368,6 @@ class AreaCoverageService {
       coverageRatio: ratio,
       boundaryPolygons: boundaryResult.boundaryPolygons,
     );
-  }
-
-  Future<_CoverageLayerResult> _estimateCoverageLayerWithZoomFallback({
-    required LatLng reference,
-    required List<List<LatLng>> coveredPolygons,
-    required List<int> zoomCandidates,
-    required String areaLabel,
-    required int sampleSteps,
-    required String Function(Map<String, dynamic> address, Map<String, dynamic> json)
-        nameResolver,
-  }) async {
-    TerritoryCoverageException? lastError;
-    for (final zoom in zoomCandidates) {
-      try {
-        return await _estimateCoverageLayer(
-          reference: reference,
-          coveredPolygons: coveredPolygons,
-          zoom: zoom,
-          areaLabel: areaLabel,
-          sampleSteps: sampleSteps,
-          nameResolver: nameResolver,
-        );
-      } on TerritoryCoverageException catch (e) {
-        lastError = e;
-      }
-    }
-
-    throw lastError ?? TerritoryCoverageException('$areaLabel の取得に失敗しました。');
   }
 
   Future<_AdministrativeBoundaryResult> _resolveAdministrativeBoundary({
@@ -367,6 +417,77 @@ class AreaCoverageService {
       '&polygon_geojson=1',
     );
 
+    final json = await _getNominatimJson(uri, context: 'zoom=$zoom');
+    if (json is! Map<String, dynamic>) {
+      throw TerritoryCoverageException('Nominatim の応答形式が不正です (zoom=$zoom)。');
+    }
+    return json;
+  }
+
+  /// 丁目名(neighbourhood)と市区名を高ズームの逆ジオコーディングで解決する。
+  /// zoom 18 で neighbourhood が空なら 16 にフォールバックする。
+  Future<({String rawTownName, String cityName})?> _resolveTownAddress({
+    required LatLng reference,
+  }) async {
+    for (final zoom in const [18, 16]) {
+      final json = await _reverseLookup(reference: reference, zoom: zoom);
+      final address = (json['address'] as Map<String, dynamic>?) ?? const {};
+      final raw = _extractRawTownName(address, json);
+      if (raw != null && raw.isNotEmpty) {
+        return (rawTownName: raw, cityName: _extractCityName(address, json));
+      }
+    }
+    return null;
+  }
+
+  /// 丁目名で forward search し、行政境界(boundary)のポリゴンを取得する。
+  /// 見つからない場合(丁目がポイントのみの地域など)は null。
+  Future<List<List<LatLng>>?> _resolveTownBoundary({
+    required String rawTownName,
+    required String cityName,
+  }) async {
+    // 市区名が無いと「本町」「旭町」等の全国頻出名で別自治体・国外の境界を拾い、
+    // もっともらしい誤った踏破率になるため、検索せずメッシュへフォールバックさせる。
+    if (cityName.isEmpty) {
+      return null;
+    }
+
+    final cacheKey = '$cityName/$rawTownName';
+    final cached = _townBoundaryCache[cacheKey];
+    if (cached != null) {
+      return cached.isEmpty ? null : cached;
+    }
+
+    final query = '$rawTownName, $cityName';
+    final uri = Uri.parse(
+      'https://nominatim.openstreetmap.org/search'
+      '?format=jsonv2'
+      '&q=${Uri.encodeQueryComponent(query)}'
+      '&addressdetails=1'
+      '&polygon_geojson=1'
+      '&limit=5',
+    );
+
+    final decoded = await _getNominatimJson(uri, context: 'town=$rawTownName');
+    if (decoded is List) {
+      for (final item in decoded) {
+        if (item is! Map<String, dynamic>) continue;
+        if (item['category'] != 'boundary') continue;
+        final polygons = _parseBoundaryPolygons(item['geojson']);
+        if (polygons.isNotEmpty) {
+          _townBoundaryCache[cacheKey] = polygons;
+          return polygons;
+        }
+      }
+    }
+    _townBoundaryCache[cacheKey] = const [];
+    return null;
+  }
+
+  /// Nominatim へ GET し、JSON をデコードして返す。通信・HTTP・パースの
+  /// いずれの失敗も TerritoryCoverageException に統一する(非JSONの200応答で
+  /// FormatException が上位に漏れて全踏破率がエラー化するのを防ぐ)。
+  Future<dynamic> _getNominatimJson(Uri uri, {required String context}) async {
     http.Response response;
     try {
       response = await http.get(
@@ -377,22 +498,22 @@ class AreaCoverageService {
         },
       ).timeout(const Duration(seconds: 15));
     } on TimeoutException {
-      throw TerritoryCoverageException('通信がタイムアウトしました (zoom=$zoom)。');
+      throw TerritoryCoverageException('通信がタイムアウトしました ($context)。');
     } catch (_) {
-      throw TerritoryCoverageException('Nominatim への通信に失敗しました (zoom=$zoom)。');
+      throw TerritoryCoverageException('Nominatim への通信に失敗しました ($context)。');
     }
 
     if (response.statusCode != 200) {
       throw TerritoryCoverageException(
-        'Nominatim reverse lookup が失敗しました (HTTP ${response.statusCode}, zoom=$zoom)。',
+        'Nominatim へのリクエストが失敗しました (HTTP ${response.statusCode}, $context)。',
       );
     }
 
-    final json = jsonDecode(response.body);
-    if (json is! Map<String, dynamic>) {
-      throw TerritoryCoverageException('Nominatim の応答形式が不正です (zoom=$zoom)。');
+    try {
+      return jsonDecode(response.body);
+    } on FormatException {
+      throw TerritoryCoverageException('Nominatim の応答を解析できませんでした ($context)。');
     }
-    return json;
   }
 
   static bool _isPointInAnyPolygon(LatLng point, List<List<LatLng>> polygons) {
@@ -424,7 +545,9 @@ class AreaCoverageService {
           '';
   }
 
-  static String _extractTownName(
+  /// 丁目名の生の値(漢数字のまま。forward search のクエリに使う)を抽出する。
+  /// 表示用に算用数字へ正規化する場合は呼び出し側で [_normalizeChomeNumerals] を通す。
+  static String? _extractRawTownName(
     Map<String, dynamic> address,
     Map<String, dynamic> json,
   ) {
@@ -454,10 +577,10 @@ class AreaCoverageService {
       if (value == cityName) {
         continue;
       }
-      return _normalizeChomeNumerals(value);
+      return value;
     }
 
-    return '';
+    return null;
   }
 
   static String _normalizeChomeNumerals(String input) {

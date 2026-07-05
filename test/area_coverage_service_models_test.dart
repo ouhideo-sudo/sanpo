@@ -34,7 +34,17 @@ void main() {
 
     expect(result.prefecture.areaName, '東京都');
     expect(result.city.areaName, '新宿区');
-    expect(result.town.areaName, '西新宿');
+    expect(result.town?.areaName, '西新宿');
+  });
+
+  test('TerritoryCoverageResult allows null town when boundary is unavailable', () {
+    final result = TerritoryCoverageResult(
+      prefecture: AdministrativeCoverageResult(areaName: '千葉県', coverageRatio: 0.1),
+      city: AdministrativeCoverageResult(areaName: '市川市', coverageRatio: 0.2),
+      town: null,
+    );
+
+    expect(result.town, isNull);
   });
 
   test('TerritoryCoverageException keeps message in toString', () {
