@@ -81,8 +81,9 @@ class _CoverageLayerResult {
 class AreaCoverageService {
   static const double _snapThresholdMeters = 20.0;
   static const double _gapCloseMeters = 18.0;
-  static const double _minPolygonAreaSqKm = 0.0008;
-  static const double _maxPolygonAreaSqKm = 2.0;
+  // 20mスナップだと正当な面でも ~150m² 程度まで小さくなり得る。下限を大きく取ると
+  // 囲まれた小区画が塗り残される(白い斑点/穴)ため、数値的な退化面だけを除く小さな値にする。
+  static const double _minPolygonAreaSqKm = 0.0001;
   final Map<int, _AdministrativeBoundaryResult> _administrativeBoundaryCache = {};
   // 丁目境界の forward search 結果キャッシュ('市区名/丁目名' -> ポリゴン)。
   // 空リストは「境界が存在しないと確認済み」を表す。
@@ -156,11 +157,39 @@ class AreaCoverageService {
       sortedAdj[u] = neighbors;
     }
 
-    // 半エッジ法でプラナーグラフの面を追跡する。
+    // 連結成分を求める（union-find）。成分ごとに外周(非有界面)を1つだけ除外するため。
+    final parent = <String, String>{};
+    String findRoot(String x) {
+      parent.putIfAbsent(x, () => x);
+      var root = x;
+      while (parent[root] != root) {
+        root = parent[root]!;
+      }
+      var cur = x;
+      while (parent[cur] != root) {
+        final next = parent[cur]!;
+        parent[cur] = root;
+        cur = next;
+      }
+      return root;
+    }
+
+    void union(String a, String b) {
+      final ra = findRoot(a);
+      final rb = findRoot(b);
+      if (ra != rb) parent[ra] = rb;
+    }
+
+    for (final entry in adjacency.entries) {
+      for (final neighbor in entry.value) {
+        union(entry.key, neighbor);
+      }
+    }
+
+    // 半エッジ法でプラナーグラフの全ての面を追跡する。
     // 有向辺 (u→v) の次の面辺は (v → CCW リスト上で u の一つ前の隣接ノード)。
-    // 内部面（有界面）は CCW 向きで符号付き面積が正になる。
     final halfEdgeVisited = <String>{};
-    final enclosedPolygons = <List<LatLng>>[];
+    final faces = <({List<LatLng> nodes, double absArea, String comp})>[];
     final safetyLimit = sortedAdj.length * 8;
 
     for (final u in orderedNodeKeys) {
@@ -189,14 +218,35 @@ class AreaCoverageService {
         }
 
         if (faceNodes.length < 3) continue;
-
-        // 向き判定は揺らぐケースがあるため、絶対面積で有効面のみを採用する。
-        final area = _signedPolygonAreaSqKm(faceNodes).abs();
-        if (area < _minPolygonAreaSqKm) continue;
-        if (area > _maxPolygonAreaSqKm) continue;
-
-        enclosedPolygons.add(faceNodes);
+        faces.add((
+          nodes: faceNodes,
+          absArea: _signedPolygonAreaSqKm(faceNodes).abs(),
+          comp: findRoot(u),
+        ));
       }
+    }
+
+    // 各連結成分で面積最大の面＝外周(非有界面)。これを成分ごとに1つだけ除外し、
+    // 残る内部面(＝ルートに囲まれた領域)をすべて採用する。固定の面積上限を使わない
+    // ため、大きな囲みも塗り残されない。単純な1周ループは内・外で同形の面が2つできるが、
+    // 外周を1つ外せば残り1つがその領域を正しく塗る。
+    final maxAreaByComp = <String, double>{};
+    for (final face in faces) {
+      if (face.absArea > (maxAreaByComp[face.comp] ?? -1)) {
+        maxAreaByComp[face.comp] = face.absArea;
+      }
+    }
+
+    final outerRemovedComps = <String>{};
+    final enclosedPolygons = <List<LatLng>>[];
+    for (final face in faces) {
+      if (!outerRemovedComps.contains(face.comp) &&
+          face.absArea >= maxAreaByComp[face.comp]! - 1e-9) {
+        outerRemovedComps.add(face.comp);
+        continue;
+      }
+      if (face.absArea < _minPolygonAreaSqKm) continue;
+      enclosedPolygons.add(face.nodes);
     }
 
     return enclosedPolygons;
